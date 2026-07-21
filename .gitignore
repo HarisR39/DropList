@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+profile.json
+applications_tracking.json
+mapping_cache.json
+screenshots/

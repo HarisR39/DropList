@@ -1,0 +1,5 @@
+playwright
+ollama
+anthropic
+pytest
+pytest-asyncio
