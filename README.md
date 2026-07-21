@@ -1,268 +1,81 @@
-# InternRadar
-### Real-Time AI-Powered Internship Aggregator
+# DropList
 
-> Find internships the moment they drop — before everyone else.
+A personal automation tool that logs into [jobright.ai](https://jobright.ai), walks through its recommended internship/job listings, opens each one's real application page, and uses an LLM to fill out the form from a structured candidate profile. It **never submits anything automatically** — every application is paused for you to review and submit yourself.
 
----
+## What it actually does
 
-## Overview
+1. Signs into jobright.ai and opens its "Recommended" jobs feed.
+2. For a configurable number of listings, opens the job detail page, clicks through jobright's own apply flow, and lands on the real company application page (Greenhouse, Lever, Ashby, and others) in a new tab.
+3. Extracts every field on that form via the accessibility tree — including messy real-world cases most naive scrapers miss:
+   - Native `<select>` dropdowns vs. custom JS-driven comboboxes (react-select-style widgets)
+   - Radio buttons and checkboxes grouped by their real shared question, not treated as isolated fields
+   - "Yes/No" toggle widgets built from plain buttons with no real form control behind them
+   - Hidden/invisible junk (reCAPTCHA fields, shadow validation inputs) filtered out
+4. Sends the field set + your profile to an LLM (local via [Ollama](https://ollama.com) by default, or Anthropic's Claude API) to map each field to a value, batching large forms so the model doesn't choke on 50+ fields at once.
+5. Fills the form via Playwright, with safety nets at every step: dropdown values are validated against the real options (falling back to a catch-all "Other"/"Not Listed" option when one exists), and anything the model can't confidently answer — or that doesn't match any real option — is flagged instead of guessed.
+6. Anything flagged gets asked about interactively in the terminal, filled in live, and remembered (`profile.json`'s `custom_answers`) so the same question on a future application is answered automatically.
+7. Pauses for you to review the filled form and submit it yourself. Nothing is ever auto-submitted.
 
-**InternRadar** is a full-stack web application that continuously monitors company career pages and job boards to surface internship postings in real time. It uses an AI-powered scraping pipeline to extract structured data, identify resume keywords, and present opportunities through a clean, filterable dashboard — with direct application links.
+## Explicit safety rules baked into the mapping
 
-Built for students who are tired of refreshing LinkedIn and missing roles the day they close.
+- Never invents facts, dates, employers, or numbers not present in the profile.
+- Refuses to guess on legally-protected EEO questions (gender, race/ethnicity, disability, veteran status) unless the profile explicitly states them — never infers from a name or any other proxy.
+- Refuses to guess on eligibility questions (work authorization, sponsorship, relocation) without an explicit profile answer.
 
----
+## Setup
 
-## Key Features
-
-| Feature | Description |
-|---|---|
-| Real-Time Posting Feed | Internships appear as soon as they're detected on company career pages |
-| AI Keyword Extractor | Automatically surfaces skills, tools, and qualifications companies are looking for |
-| Direct Apply Links | One-click links to the original application page — no middleman |
-| Multi-Source Aggregation | Scrapes company career portals, Greenhouse, Lever, Workday, and more |
-| Alert System | Email/push notifications when a role matching your profile is posted |
-| Smart Filtering | Filter by role, location, stack, deadline, season, and company size |
-| Keyword Analytics | See what skills appear most across all postings in a given field |
-
----
-
-## Tech Stack
-
-### Frontend
-- **Framework**: React (Vite) or Next.js
-- **Styling**: Tailwind CSS
-- **State**: Zustand or React Query
-- **Charts**: Recharts (for keyword frequency analytics)
-
-### Backend
-- **Runtime**: Node.js (Express) or Python (FastAPI)
-- **Scraping Engine**: Playwright or Puppeteer (headless browser for JS-heavy career pages)
-- **AI Layer**: Anthropic Claude API — keyword extraction, role classification, and summary generation
-- **Job Queue**: BullMQ + Redis (rate-limited scraping scheduler)
-- **Database**: PostgreSQL (postings, companies, keywords) + Redis (caching + dedup)
-
-### Infrastructure
-- **Hosting**: Fly.io / Railway / Render
-- **Scraper Workers**: Docker containers, horizontally scalable
-- **Scheduler**: Cron jobs or event-driven triggers per source
-- **Notifications**: Resend (email) + Web Push API
-
----
-
-## Project Structure
-
-```
-internradar/
-├── apps/
-│   ├── web/                  # React/Next.js frontend
-│   │   ├── components/
-│   │   │   ├── PostingCard.tsx
-│   │   │   ├── KeywordBadge.tsx
-│   │   │   ├── FilterSidebar.tsx
-│   │   │   └── AlertModal.tsx
-│   │   └── pages/
-│   │       ├── index.tsx     # Main feed
-│   │       ├── posting/[id]  # Individual posting view
-│   │       └── analytics.tsx # Keyword trends
-│   └── api/                  # Backend server
-│       ├── routes/
-│       │   ├── postings.ts
-│       │   ├── alerts.ts
-│       │   └── keywords.ts
-│       └── services/
-│           ├── scraper.ts
-│           ├── aiExtractor.ts
-│           └── deduplicator.ts
-├── scrapers/
-│   ├── sources/
-│   │   ├── greenhouse.ts
-│   │   ├── lever.ts
-│   │   ├── workday.ts
-│   │   └── custom/          # Per-company scrapers
-│   ├── scheduler.ts
-│   └── queue.ts
-├── workers/
-│   └── scrapeWorker.ts
-├── db/
-│   ├── schema.sql
-│   └── migrations/
-├── docker-compose.yml
-└── README.md
-```
-
----
-
-## AI Pipeline
-
-Each scraped posting goes through a multi-step AI processing pipeline:
-
-```
-Raw HTML / Job Description
-        |
-  Text Extraction (Playwright)
-        |
-  Claude API -- aiExtractor
-        | outputs:
-  +-----------------------------------------+
-  |  - Role title (normalized)              |
-  |  - Required skills (ranked)             |
-  |  - Preferred skills                     |
-  |  - Resume keywords to match             |
-  |  - Season / term (Summer 2026)          |
-  |  - Remote / hybrid / onsite             |
-  |  - Application deadline (if any)        |
-  |  - 2-sentence TL;DR summary             |
-  +-----------------------------------------+
-        |
-  Stored in PostgreSQL + served to frontend
-```
-
-**Prompt strategy**: Claude is given the raw job description and asked to return structured JSON with keyword categories (hard skills, soft skills, domain knowledge, tools/frameworks). This output powers both the keyword badge UI and the analytics dashboard.
-
----
-
-## Database Schema (Simplified)
-
-```sql
--- Companies being tracked
-CREATE TABLE companies (
-  id UUID PRIMARY KEY,
-  name TEXT NOT NULL,
-  career_url TEXT NOT NULL,
-  ats_platform TEXT,           -- greenhouse | lever | workday | custom
-  scrape_interval_minutes INT DEFAULT 60,
-  last_scraped_at TIMESTAMPTZ
-);
-
--- Internship postings
-CREATE TABLE postings (
-  id UUID PRIMARY KEY,
-  company_id UUID REFERENCES companies(id),
-  title TEXT NOT NULL,
-  location TEXT,
-  remote BOOLEAN,
-  apply_url TEXT NOT NULL,
-  description_raw TEXT,
-  summary TEXT,
-  season TEXT,                 -- "Summer 2026"
-  deadline DATE,
-  first_seen_at TIMESTAMPTZ DEFAULT NOW(),
-  is_active BOOLEAN DEFAULT TRUE
-);
-
--- Extracted keywords per posting
-CREATE TABLE keywords (
-  id UUID PRIMARY KEY,
-  posting_id UUID REFERENCES postings(id),
-  keyword TEXT NOT NULL,
-  category TEXT,               -- hard_skill | soft_skill | tool | domain
-  importance TEXT              -- required | preferred
-);
-
--- User alert subscriptions
-CREATE TABLE alerts (
-  id UUID PRIMARY KEY,
-  email TEXT NOT NULL,
-  keywords TEXT[],
-  roles TEXT[],
-  locations TEXT[],
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
----
-
-## Scraping Architecture
-
-- **Polling**: Each source is scraped on a configurable interval (default: 60 min, configurable down to 15 min for high-signal companies)
-- **Deduplication**: Posting fingerprinted by `(company_id + title + apply_url hash)` — no duplicates in the feed
-- **Rate limiting**: BullMQ enforces per-domain concurrency limits to avoid getting blocked
-- **Headless rendering**: Playwright handles SPAs and JS-rendered career pages (Workday, Greenhouse iframes, etc.)
-- **Robots.txt compliance**: Scraper checks and respects crawl rules per domain
-
----
-
-## Alert System
-
-Users can subscribe with:
-- Target keywords (e.g., `Python`, `React`, `ML`)
-- Role types (e.g., `SWE`, `Data Science`, `PM`)
-- Location preference
-- Specific companies to watch
-
-When a new posting is inserted that matches a user's alert profile, an email is dispatched via Resend within minutes of detection.
-
----
-
-## Roadmap
-
-- [x] Core scraper scaffold
-- [x] AI keyword extraction pipeline
-- [x] Posting feed UI with filters
-- [ ] User accounts + alert subscriptions
-- [ ] Keyword analytics dashboard
-- [ ] Browser extension for one-click "track this company"
-- [ ] Resume match score (upload resume, see how well you match each posting)
-- [ ] ATS coverage expanded (iCIMS, SmartRecruiters, Ashby)
-- [ ] Public API for third-party integrations
-
----
-
-## Getting Started (Dev)
+Requires Python 3.12+ and [Ollama](https://ollama.com) (for local, free LLM inference) or an Anthropic API key.
 
 ```bash
-# Clone the repo
-git clone https://github.com/yourusername/internradar.git
-cd internradar
-
-# Install dependencies
-npm install
-
-# Set environment variables
-cp .env.example .env
-# Add: ANTHROPIC_API_KEY, DATABASE_URL, REDIS_URL, RESEND_API_KEY
-
-# Start local services
-docker-compose up -d   # PostgreSQL + Redis
-
-# Run migrations
-npm run db:migrate
-
-# Start the dev server
-npm run dev
+pip install -r requirements.txt
+playwright install chromium
+ollama pull llama3.1:8b   # if using the default local provider
 ```
 
----
+Copy `profile.example.json` to `profile.json` and fill in your real information — this file is gitignored and never committed.
 
-## Environment Variables
+Set the following environment variables (e.g. via `setx` on Windows, so they persist across terminal sessions):
 
-```env
-ANTHROPIC_API_KEY=       # Claude API key (keyword extraction)
-DATABASE_URL=            # PostgreSQL connection string
-REDIS_URL=               # Redis connection string
-RESEND_API_KEY=          # Email notification service
-NEXT_PUBLIC_API_URL=     # Frontend -> API base URL
-SCRAPE_INTERVAL_MINUTES= # Default: 60
+| Variable | Required | Purpose |
+|---|---|---|
+| `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | Yes | Your jobright.ai login |
+| `ANTHROPIC_API_KEY` | Only if using Claude | Needed if `AUTOFILL_LLM_PROVIDER=anthropic` |
+| `AUTOFILL_LLM_PROVIDER` | No | `ollama` (default) or `anthropic` |
+| `OLLAMA_MODEL` | No | Default `llama3.1:8b` |
+| `AUTOFILL_LLM_TIMEOUT` | No | Seconds before a mapping call gives up (default 150) |
+| `AUTOFILL_MAPPING_BATCH_SIZE` | No | Fields per LLM call (default 12) |
+
+## Running it
+
+```bash
+python main.py
 ```
 
----
+Adjust `NUM_LISTINGS_TO_REVIEW` and `MAX_FORM_STEPS` at the top of `main.py` to control how many listings to process per run and how many steps a multi-step form is allowed to take.
 
-## Legal & Ethical Notes
+## Testing
 
-- This project respects `robots.txt` directives on all scraped domains
-- Postings are not reproduced in full — only metadata and extracted keywords are stored
-- Direct apply links point back to the original company page
-- No login walls are bypassed; only publicly accessible career pages are scraped
+```bash
+pytest
+```
 
----
+43 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, mapping cache, batching and per-batch failure isolation, and the interactive review flow.
 
-## Contributing
+## Project layout
 
-PRs welcome. If you want to add a new ATS platform scraper or a company to the default watchlist, open an issue first to discuss the approach.
+- `main.py` — the runnable script: login, navigation, review loop.
+- `autofill.py` — the actual engine: field extraction, LLM mapping, form filling, multi-step handling.
+- `mapping_cache.py` — local JSON cache of LLM field mappings, keyed by domain + field-set hash.
+- `application_tracking.py` — local JSON record of what's been applied to and what still needs review.
+- `profile.json` (gitignored) / `profile.example.json` (template) — candidate profile data.
+- `main_autofill.py` — the pytest suite for `autofill.py`.
 
----
+## Tech stack
 
-## License
+Python (asyncio), Playwright, Ollama, Anthropic API, pytest/pytest-asyncio. No database — local JSON files for caching and tracking state.
 
-MIT
+## A few honest caveats
+
+- This automates a third-party site's own UI (jobright.ai) and a wide variety of real company application forms. Selectors and quirks are handled defensively, but ATS platforms change their markup over time and new patterns will surface.
+- Local LLMs (the default) are meaningfully less reliable than a frontier hosted model at strict JSON output and judgment calls on ambiguous fields — expect to answer more things interactively than you would with Claude.
+- This is a personal-use tool, not a polished product. It's meant to save you from re-typing the same information into every application form, not to submit applications without your involvement.
