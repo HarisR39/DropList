@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import urllib.request
 
 from playwright.async_api import async_playwright
 
@@ -10,6 +11,7 @@ from autofill import autofill_form_multistep
 NUM_LISTINGS_TO_REVIEW = 5
 MAX_FORM_STEPS = 6
 SCREENSHOT_DIR = "screenshots"
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 
 
 def load_profile() -> dict:
@@ -20,6 +22,23 @@ def load_profile() -> dict:
 def save_profile(profile: dict) -> None:
     with open("profile.json", "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2)
+
+
+def notify(message: str) -> None:
+    """Push a phone notification via ntfy.sh (https://ntfy.sh/<topic>) if
+    NTFY_TOPIC is set. Best-effort -- a failed notification shouldn't crash
+    the run, just gets logged."""
+    if not NTFY_TOPIC:
+        print("  (notification skipped: NTFY_TOPIC environment variable is not set)")
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}", data=message.encode("utf-8"), method="POST"
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        print(f"  (notification sent to ntfy.sh/{NTFY_TOPIC}, status {resp.status})")
+    except Exception as e:
+        print(f"  (notification failed: {e})")
 
 
 async def main():
@@ -60,6 +79,13 @@ async def main():
             if await page.query_selector("#___reactour") is not None:
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(300)
+
+            # The "Customize Your Resume" modal (with the "Apply without
+            # Customizing" link) only shows up for listings with a low profile
+            # match score -- for others, this click opens the company tab
+            # directly with no modal at all. Watch for a new page across the
+            # whole apply-now click, not just the modal-click that may not happen.
+            pages_before = set(page.context.pages)
             await page.click("#apply-now-button-id", force=True)
             await page.wait_for_timeout(800)
 
@@ -68,13 +94,23 @@ async def main():
                 await exit_button.first.click()
 
             company_page = None
-            try:
-                async with page.context.expect_page(timeout=6000) as new_page_info:
-                    await page.click("text=Apply without Customizing", timeout=5000)
-                company_page = await new_page_info.value
+            new_pages = [p for p in page.context.pages if p not in pages_before]
+            if new_pages:
+                company_page = new_pages[0]
+            else:
+                apply_without_customizing = page.get_by_text("Apply without Customizing", exact=True)
+                if await apply_without_customizing.count() > 0:
+                    try:
+                        async with page.context.expect_page(timeout=6000) as new_page_info:
+                            await apply_without_customizing.click(timeout=5000)
+                        company_page = await new_page_info.value
+                    except Exception:
+                        company_page = None
+
+            if company_page is not None:
                 await company_page.wait_for_load_state()
                 print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Company page opened: {company_page.url}")
-            except Exception:
+            else:
                 print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] No resume-customize popup or new tab appeared; "
                       f"check the browser window.")
 
@@ -97,6 +133,13 @@ async def main():
                         max_steps=MAX_FORM_STEPS,
                         screenshot_dir=SCREENSHOT_DIR,
                         screenshot_prefix=f"job_{job_id}",
+                        # The interactive terminal prompts below block until someone
+                        # is actually there to answer them -- notify the moment the
+                        # AI hands off, not only after all of them are answered.
+                        on_needs_review=lambda items: notify(
+                            f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] {len(items)} field(s) need your input -- "
+                            f"come back to the terminal."
+                        ),
                     )
                 except Exception as e:
                     print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Autofill failed on this page ({e}); "
@@ -107,20 +150,29 @@ async def main():
                 # entries from what you typed in during this listing -- persist those.
                 save_profile(profile)
 
-                if result is not None:
-                    if result.needs_review or result.errors:
-                        application_tracking.record(
-                            job_id, "needs_review", company_page.url, result.needs_review, result.errors
-                        )
-                        print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Needs review: "
-                              f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
-                        for item in result.needs_review:
-                            print(f"    - {item['label']}: {item['reasoning']}")
-                        for item in result.errors:
-                            print(f"    ! {item['label']}: {item['error']}")
-                    else:
-                        application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
-                        print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] All fields filled confidently.")
+                # Notify as soon as the AI's autofill attempt is done, one way or
+                # another -- success, needs review, or failed -- not just when the
+                # application ends up fully ready to submit. You might be away from
+                # the browser and want to know it's done either way.
+                if result is None:
+                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Autofill failed on this page -- "
+                           f"you'll need to fill it manually.")
+                elif result.needs_review or result.errors:
+                    application_tracking.record(
+                        job_id, "needs_review", company_page.url, result.needs_review, result.errors
+                    )
+                    print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Needs review: "
+                          f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
+                    for item in result.needs_review:
+                        print(f"    - {item['label']}: {item['reasoning']}")
+                    for item in result.errors:
+                        print(f"    ! {item['label']}: {item['error']}")
+                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Filled, but {len(result.needs_review)} "
+                           f"field(s) need your review before you submit.")
+                else:
+                    application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
+                    print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] All fields filled confidently.")
+                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Application filled and ready to review/submit.")
 
             input(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Review the form in the browser "
                   f"(check anything flagged above), then submit manually if it looks right. "

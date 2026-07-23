@@ -20,6 +20,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,6 +58,10 @@ NEXT_BUTTON_NAMES = ["Next", "Continue", "Next Step"]
 # shortcut, or a small "Apply" pill that just scrolls to the form section),
 # which would hijack every step instead of ever reaching the real form.
 ENTRY_BUTTON_NAMES = ["Apply Now", "Apply for this Job", "Apply for this position", "Start Application", "Begin Application"]
+# Fallback for ATS platforms that embed the job title in the button, e.g.
+# "Apply for Software Engineering Intern" -- requires a word after "Apply" so
+# it still excludes a bare "Apply" pill and "Quick Apply with MyGreenhouse".
+GENERIC_APPLY_BUTTON_PATTERN = re.compile(r"^apply\b.+", re.IGNORECASE)
 
 COOKIE_BANNER_SELECTORS = ["#onetrust-accept-btn-handler"]
 COOKIE_BANNER_BUTTON_NAMES = [
@@ -285,7 +290,7 @@ async def extract_fields(page: Page) -> list[FormField]:
                 .filter(el => el.type !== 'radio' && (el.type !== 'checkbox' || ungroupedCheckboxes.includes(el)));
 
             simpleInputs.forEach((el) => {
-                if (el.type === 'hidden' || el.disabled) return;
+                if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.disabled) return;
                 if (el.name === 'g-recaptcha-response' || el.id.startsWith('g-recaptcha')) return;
                 if (!isVisible(el)) return;
 
@@ -758,9 +763,37 @@ async def find_next_button(page: Page):
     return await find_button_by_names(page, NEXT_BUTTON_NAMES)
 
 
-async def find_entry_button(page: Page):
-    """Return a locator for an initial Apply/Start Application button, or None."""
-    return await find_button_by_names(page, ENTRY_BUTTON_NAMES)
+async def find_entry_button(page: Page, allow_bare_apply: bool = False):
+    """Return a locator for an initial Apply/Start Application button, or None.
+
+    allow_bare_apply enables matching an exact, bare "Apply" button as a last
+    resort. That's deliberately gated behind a flag rather than always on: a
+    bare "Apply" also matches unrelated in-page controls on pages that already
+    have a real form on them (a "Quick Apply with MyGreenhouse" shortcut, or a
+    small "Apply" pill that just scrolls to the form section) -- clicking those
+    instead of filling the already-present form caused real bugs before. It's
+    only safe to try when the page genuinely has no fields yet, which the
+    caller is expected to check."""
+    exact = await find_button_by_names(page, ENTRY_BUTTON_NAMES)
+    if exact is not None:
+        return exact
+
+    # Some ATS platforms render a dynamic "Apply for <Job Title>" button whose
+    # exact text can't be listed ahead of time. Match anything starting with
+    # "Apply" followed by more text -- this still excludes a bare "Apply" pill
+    # (e.g. a scroll-to-form shortcut) and unrelated "Quick Apply ..." controls
+    # that don't start with the word, both of which caused real problems before.
+    for role in ("button", "link"):
+        locator = page.get_by_role(role, name=GENERIC_APPLY_BUTTON_PATTERN)
+        if await locator.count() > 0:
+            return locator.first
+
+    if allow_bare_apply:
+        for role in ("button", "link"):
+            locator = page.get_by_role(role, name="Apply", exact=True)
+            if await locator.count() > 0:
+                return locator.first
+    return None
 
 
 async def dismiss_cookie_banner(page: Page) -> bool:
@@ -866,13 +899,19 @@ async def autofill_form_multistep(
     screenshot_dir: str | None = None,
     screenshot_prefix: str = "form",
     interactive: bool = True,
+    on_needs_review: Any = None,
 ) -> AutofillResult:
     """Fill a (possibly multi-step) application form, advancing through
     Next/Continue steps up to max_steps. Also handles landing pages with no
     form yet by clicking an initial Apply/Start Application button. Never
     clicks a final Submit — that's left for a human to do after reviewing
     the filled form. If interactive, prompts for anything Claude couldn't
-    confidently answer and remembers the answer in profile['custom_answers']."""
+    confidently answer and remembers the answer in profile['custom_answers'].
+
+    on_needs_review, if given, is called with the list of needs_review items
+    right before blocking on the interactive terminal prompts -- e.g. to fire
+    a notification the moment the AI hands off to a human, since the prompts
+    themselves block until someone is actually there to answer them."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -880,11 +919,17 @@ async def autofill_form_multistep(
     await dismiss_cookie_banner(page)
 
     for step in range(max_steps):
-        # Checked every step, not just when the field list is empty: many career
-        # sites keep a persistent header (search box, language picker, etc.) that
-        # shows up as "fields" even on the pre-application landing page, so an
-        # empty-fields check alone would miss the Apply Now button entirely.
-        entry_button = await find_entry_button(page)
+        # Fields are extracted first (not gated behind the entry-button check):
+        # many career sites keep a persistent header (search box, language
+        # picker, etc.) that shows up as "fields" even on the pre-application
+        # landing page, so we still need to check for an entry button even when
+        # fields are already present. But a bare "Apply" match is only safe to
+        # try when there are truly zero fields yet -- seeing any fields already
+        # means clicking a bare "Apply" risks hitting an unrelated shortcut
+        # instead of just filling what's already there (see find_entry_button).
+        fields = await extract_fields(page)
+
+        entry_button = await find_entry_button(page, allow_bare_apply=not fields)
         if entry_button is not None:
             try:
                 await entry_button.click(timeout=5000)
@@ -899,7 +944,6 @@ async def autofill_form_multistep(
             await _settle(page)
             continue
 
-        fields = await extract_fields(page)
         if not fields:
             break
 
@@ -908,6 +952,8 @@ async def autofill_form_multistep(
 
         result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields)
         remaining_needs_review = result.needs_review
+        if remaining_needs_review and on_needs_review is not None:
+            on_needs_review(remaining_needs_review)
         if interactive and remaining_needs_review:
             remaining_needs_review = await _resolve_needs_review_interactively(page, profile, remaining_needs_review)
 

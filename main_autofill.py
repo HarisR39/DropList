@@ -581,6 +581,49 @@ async def test_multistep_form_advances_and_stops_when_no_next_button(monkeypatch
     assert result.needs_review == [{"label": "Essay", "reasoning": "unknown"}]
 
 
+async def test_multistep_calls_on_needs_review_before_blocking_on_input(monkeypatch):
+    # The interactive terminal prompts block until a human answers them --
+    # on_needs_review must fire before that, not after, so a caller (e.g. a
+    # notification) isn't stuck waiting on the same block it's meant to warn about.
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
+    needs_review_items = [{"label": "Essay", "reasoning": "unknown"}]
+    monkeypatch.setattr(
+        autofill, "autofill_form",
+        AsyncMock(return_value=AutofillResult(filled=[], needs_review=needs_review_items, errors=[])),
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    interactive_resolver_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(autofill, "_resolve_needs_review_interactively", interactive_resolver_mock)
+
+    seen = []
+    page = FakePage()
+    await autofill.autofill_form_multistep(
+        page, PROFILE, resume_path="resume.pdf", max_steps=6,
+        on_needs_review=seen.append,
+    )
+
+    assert seen == [needs_review_items]
+    interactive_resolver_mock.assert_awaited_once()
+
+
+async def test_multistep_on_needs_review_not_called_when_nothing_needs_review(monkeypatch):
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
+    monkeypatch.setattr(
+        autofill, "autofill_form",
+        AsyncMock(return_value=AutofillResult(filled=["Name"], needs_review=[], errors=[])),
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    callback = MagicMock()
+    page = FakePage()
+    await autofill.autofill_form_multistep(
+        page, PROFILE, resume_path="resume.pdf", max_steps=6, on_needs_review=callback
+    )
+
+    callback.assert_not_called()
+
+
 async def test_multistep_form_caps_at_max_steps(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
     monkeypatch.setattr(
@@ -636,6 +679,7 @@ async def test_multistep_survives_entry_button_click_exception(monkeypatch):
     # once, and give up gracefully if it still fails.
     entry_button = MagicMock()
     entry_button.click = AsyncMock(side_effect=Exception("intercepted"))
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=[]))
     monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=entry_button))
     monkeypatch.setattr(autofill, "dismiss_cookie_banner", AsyncMock(return_value=False))
     autofill_form_mock = AsyncMock()
@@ -657,6 +701,66 @@ async def test_find_entry_button_matches_apply_now_link():
 async def test_find_entry_button_returns_none_when_absent():
     page = FakePage()
     assert await autofill.find_entry_button(page) is None
+
+
+async def test_find_entry_button_matches_dynamic_job_title_button():
+    # Some ATS platforms embed the job title in the button text (e.g. "Apply
+    # for Software Engineering Intern"), which isn't in the fixed name list.
+    page = FakePage()
+    page.set_role_button("button", autofill.GENERIC_APPLY_BUTTON_PATTERN)
+    assert await autofill.find_entry_button(page) is not None
+
+
+async def test_find_entry_button_generic_pattern_does_not_match_bare_apply():
+    assert not autofill.GENERIC_APPLY_BUTTON_PATTERN.match("Apply")
+
+
+async def test_find_entry_button_generic_pattern_does_not_match_quick_apply():
+    assert not autofill.GENERIC_APPLY_BUTTON_PATTERN.match("Quick Apply with MyGreenhouse")
+
+
+async def test_find_entry_button_generic_pattern_matches_dynamic_titles():
+    assert autofill.GENERIC_APPLY_BUTTON_PATTERN.match("Apply for Software Engineering Intern")
+    assert autofill.GENERIC_APPLY_BUTTON_PATTERN.match("Apply now")
+    assert autofill.GENERIC_APPLY_BUTTON_PATTERN.match("Apply for this Job")
+
+
+async def test_find_entry_button_ignores_bare_apply_by_default():
+    # A bare "Apply" also matches unrelated in-page controls on pages that
+    # already have a real form (a "Quick Apply" shortcut, a scroll-to-form
+    # pill) -- must not match unless the caller explicitly opts in.
+    page = FakePage()
+    page.set_role_button("button", "Apply")
+    assert await autofill.find_entry_button(page) is None
+    assert await autofill.find_entry_button(page, allow_bare_apply=False) is None
+
+
+async def test_find_entry_button_matches_bare_apply_when_allowed():
+    # Some small/simple career pages have literally nothing but a bare
+    # "Apply" button -- correct to click when the page truly has no fields.
+    page = FakePage()
+    page.set_role_button("button", "Apply")
+    assert await autofill.find_entry_button(page, allow_bare_apply=True) is not None
+
+
+async def test_multistep_does_not_click_bare_apply_when_fields_already_present(monkeypatch):
+    # The exact SAP-style false positive this is guarding against: a bare
+    # "Apply" pill coexisting with a real, already-fillable form -- clicking
+    # it would derail filling the form that's already there.
+    fields = [FormField("f0", "Some Field", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    find_entry_button_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(autofill, "find_entry_button", find_entry_button_mock)
+    monkeypatch.setattr(
+        autofill, "autofill_form", AsyncMock(return_value=AutofillResult(filled=["Some Field"], needs_review=[], errors=[]))
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    page = FakePage()
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    find_entry_button_mock.assert_awaited_once_with(page, allow_bare_apply=False)
+    assert result.filled == ["Some Field"]
 
 
 async def test_dismiss_cookie_banner_clicks_known_accept_button():
