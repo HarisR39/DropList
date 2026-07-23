@@ -5,16 +5,25 @@ A personal automation tool that logs into [jobright.ai](https://jobright.ai), wa
 ## What it actually does
 
 1. Signs into jobright.ai and opens its "Recommended" jobs feed.
-2. For a configurable number of listings, opens the job detail page, clicks through jobright's own apply flow, and lands on the real company application page (Greenhouse, Lever, Ashby, and others) in a new tab.
-3. Extracts every field on that form via the accessibility tree — including messy real-world cases most naive scrapers miss:
+2. For a configurable number of listings, opens the job detail page, clicks through jobright's own apply flow, and lands on the real company application page (Greenhouse, Lever, Ashby, SmartRecruiters, Rippling, Gusto, and others) in a new tab. This step alone handles a pile of real-world inconsistency: a full-screen onboarding-tour overlay that can intercept clicks, a "did you apply?" popup that shows up when you switch back to the jobright tab, and an apply flow that sometimes shows a "customize your resume" modal first and sometimes opens the company tab directly with no modal at all.
+3. If the company page is just a landing page with no form yet, finds and clicks through the real "Apply"-style button — including ones with dynamic text like "Apply for Software Engineering Intern" that can't be matched by a fixed list, while still avoiding false positives like a "Quick Apply" shortcut or a bare "Apply" pill sitting next to a form that's already loaded.
+4. Extracts every field on the real form via the accessibility tree — including messy real-world cases most naive scrapers miss:
    - Native `<select>` dropdowns vs. custom JS-driven comboboxes (react-select-style widgets)
    - Radio buttons and checkboxes grouped by their real shared question, not treated as isolated fields
    - "Yes/No" toggle widgets built from plain buttons with no real form control behind them
-   - Hidden/invisible junk (reCAPTCHA fields, shadow validation inputs) filtered out
-4. Sends the field set + your profile to an LLM (local via [Ollama](https://ollama.com) by default, or Anthropic's Claude API) to map each field to a value, batching large forms so the model doesn't choke on 50+ fields at once.
-5. Fills the form via Playwright, with safety nets at every step: dropdown values are validated against the real options (falling back to a catch-all "Other"/"Not Listed" option when one exists), and anything the model can't confidently answer — or that doesn't match any real option — is flagged instead of guessed.
-6. Anything flagged gets asked about interactively in the terminal, filled in live, and remembered (`profile.json`'s `custom_answers`) so the same question on a future application is answered automatically.
-7. Pauses for you to review the filled form and submit it yourself. Nothing is ever auto-submitted.
+   - Hidden/invisible junk (reCAPTCHA fields, shadow validation inputs, submit buttons) filtered out
+5. Sends the field set + your profile to an LLM (local via [Ollama](https://ollama.com) by default, or Anthropic's Claude API) to map each field to a value, batching large forms so the model doesn't choke on 50+ fields at once.
+6. Fills the form via Playwright, with safety nets at every step: dropdown values are validated against the real options (falling back to a catch-all "Other"/"Not Listed" option when one exists), and anything the model can't confidently answer — or that doesn't match any real option — is flagged instead of guessed.
+7. Anything flagged gets asked about interactively in the terminal, filled in live, and remembered (`profile.json`'s `custom_answers`) so the same question on a future application is answered automatically. A push notification (see below) fires the moment the AI hands off, since those prompts block until you're actually there to answer them.
+8. Pauses for you to review the filled form and submit it yourself. Nothing is ever auto-submitted.
+
+## Notifications
+
+If `NTFY_TOPIC` is set, [ntfy.sh](https://ntfy.sh) push notifications fire at the natural checkpoints of a run, so you don't have to babysit the terminal:
+- The moment a field needs your input (before it blocks on the interactive prompt)
+- When a listing finishes: filled and ready to submit, filled but flagged for review, or failed outright
+
+Install the ntfy app, subscribe to a topic of your choosing (pick something random/hard-to-guess — topics are public by default), and set `NTFY_TOPIC` to that value.
 
 ## Explicit safety rules baked into the mapping
 
@@ -40,10 +49,13 @@ Set the following environment variables (e.g. via `setx` on Windows, so they per
 |---|---|---|
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | Yes | Your jobright.ai login |
 | `ANTHROPIC_API_KEY` | Only if using Claude | Needed if `AUTOFILL_LLM_PROVIDER=anthropic` |
+| `NTFY_TOPIC` | No | Enables push notifications (see below) |
 | `AUTOFILL_LLM_PROVIDER` | No | `ollama` (default) or `anthropic` |
 | `OLLAMA_MODEL` | No | Default `llama3.1:8b` |
 | `AUTOFILL_LLM_TIMEOUT` | No | Seconds before a mapping call gives up (default 150) |
 | `AUTOFILL_MAPPING_BATCH_SIZE` | No | Fields per LLM call (default 12) |
+
+On Windows, `setx` only takes effect in terminals/processes started *after* it runs — restart your terminal (or fully quit and reopen VS Code, since its integrated terminal inherits the editor's own environment) before running the script.
 
 ## Running it
 
@@ -59,7 +71,7 @@ Adjust `NUM_LISTINGS_TO_REVIEW` and `MAX_FORM_STEPS` at the top of `main.py` to 
 pytest
 ```
 
-43 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, mapping cache, batching and per-batch failure isolation, and the interactive review flow.
+52 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, dynamic/bare "Apply" button detection, mapping cache, batching and per-batch failure isolation, and the interactive review flow (including the notification callback).
 
 ## Project layout
 
