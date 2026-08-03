@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import urllib.request
+from typing import Any, Callable
 
 from playwright.async_api import async_playwright
 
@@ -41,9 +42,31 @@ def notify(message: str) -> None:
         print(f"  (notification failed: {e})")
 
 
-async def main():
+async def run_automation(
+    profile: dict,
+    log: Callable[[str], None] = print,
+    confirm_fn: Callable[[str], None] | None = None,
+    ask_fn: Any = None,
+    num_listings: int = NUM_LISTINGS_TO_REVIEW,
+    max_steps: int = MAX_FORM_STEPS,
+) -> None:
+    """Sign into jobright.ai and walk through its recommended listings,
+    autofilling each one's real application form. Never submits anything --
+    always pauses for a human to review and submit.
+
+    log() replaces plain print() so a GUI can route status text into its own
+    view instead of (or alongside) the terminal.
+
+    confirm_fn(prompt), if given, replaces the terminal input() calls that
+    just wait for acknowledgement (review-and-continue, the "did you apply?"
+    popup) -- called with a message, expected to block until the user
+    acknowledges, return value is ignored. Defaults to real input().
+
+    ask_fn, if given, is passed through to autofill_form_multistep to replace
+    the terminal prompt for fields the AI couldn't confidently answer -- see
+    autofill.autofill_form_multistep's docstring."""
+    confirm = confirm_fn or (lambda prompt: input(prompt))
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-    profile = load_profile()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=50)
@@ -56,10 +79,10 @@ async def main():
         await page.wait_for_url("**/jobs/recommend**", timeout=15000)
         await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
 
-        for i in range(NUM_LISTINGS_TO_REVIEW):
+        for i in range(num_listings):
             titles = await page.query_selector_all("h2.index_job-title__Riiip")
             if i >= len(titles):
-                print(f"Only {len(titles)} listings loaded, stopping early.")
+                log(f"Only {len(titles)} listings loaded, stopping early.")
                 break
 
             await titles[i].click()
@@ -94,7 +117,7 @@ async def main():
                 await exit_button.first.click()
 
             company_page = None
-            new_pages = [p for p in page.context.pages if p not in pages_before]
+            new_pages = [p2 for p2 in page.context.pages if p2 not in pages_before]
             if new_pages:
                 company_page = new_pages[0]
             else:
@@ -109,10 +132,10 @@ async def main():
 
             if company_page is not None:
                 await company_page.wait_for_load_state()
-                print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Company page opened: {company_page.url}")
+                log(f"[{i + 1}/{num_listings}] Company page opened: {company_page.url}")
             else:
-                print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] No resume-customize popup or new tab appeared; "
-                      f"check the browser window.")
+                log(f"[{i + 1}/{num_listings}] No resume-customize popup or new tab appeared; "
+                    f"check the browser window.")
 
             if company_page is not None:
                 # let redirects/dynamic content settle before reading the form.
@@ -130,20 +153,21 @@ async def main():
                         profile,
                         profile["resume_path"],
                         profile.get("cover_letter_path"),
-                        max_steps=MAX_FORM_STEPS,
+                        max_steps=max_steps,
                         screenshot_dir=SCREENSHOT_DIR,
                         screenshot_prefix=f"job_{job_id}",
-                        # The interactive terminal prompts below block until someone
-                        # is actually there to answer them -- notify the moment the
+                        # The interactive prompts below block until someone is
+                        # actually there to answer them -- notify the moment the
                         # AI hands off, not only after all of them are answered.
                         on_needs_review=lambda items: notify(
-                            f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] {len(items)} field(s) need your input -- "
+                            f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
                             f"come back to the terminal."
                         ),
+                        ask_fn=ask_fn,
                     )
                 except Exception as e:
-                    print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Autofill failed on this page ({e}); "
-                          f"you'll need to fill it manually.")
+                    log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
+                        f"you'll need to fill it manually.")
                     result = None
 
                 # autofill_form_multistep may have added new profile['custom_answers']
@@ -155,41 +179,46 @@ async def main():
                 # application ends up fully ready to submit. You might be away from
                 # the browser and want to know it's done either way.
                 if result is None:
-                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Autofill failed on this page -- "
+                    notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
                            f"you'll need to fill it manually.")
                 elif result.needs_review or result.errors:
                     application_tracking.record(
                         job_id, "needs_review", company_page.url, result.needs_review, result.errors
                     )
-                    print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Needs review: "
-                          f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
+                    log(f"[{i + 1}/{num_listings}] Needs review: "
+                        f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
                     for item in result.needs_review:
-                        print(f"    - {item['label']}: {item['reasoning']}")
+                        log(f"    - {item['label']}: {item['reasoning']}")
                     for item in result.errors:
-                        print(f"    ! {item['label']}: {item['error']}")
-                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Filled, but {len(result.needs_review)} "
+                        log(f"    ! {item['label']}: {item['error']}")
+                    notify(f"[{i + 1}/{num_listings}] Filled, but {len(result.needs_review)} "
                            f"field(s) need your review before you submit.")
                 else:
                     application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
-                    print(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] All fields filled confidently.")
-                    notify(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Application filled and ready to review/submit.")
+                    log(f"[{i + 1}/{num_listings}] All fields filled confidently.")
+                    notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
 
-            input(f"[{i + 1}/{NUM_LISTINGS_TO_REVIEW}] Review the form in the browser "
-                  f"(check anything flagged above), then submit manually if it looks right. "
-                  f"Press Enter to continue...")
+            confirm(f"[{i + 1}/{num_listings}] Review the form in the browser "
+                    f"(check anything flagged above), then submit manually if it looks right. "
+                    f"Press Enter to continue...")
 
             # jobright shows a "Did you apply?" popup when you switch back to this tab
             # after visiting the company page -- that's your call to answer, not the
             # script's, and leaving it open can block the next listing's clicks.
             did_you_apply = page.get_by_text("Did you apply", exact=False)
             if await did_you_apply.count() > 0:
-                input("A \"Did you apply?\" popup is open in the browser -- click Yes or "
-                      "No yourself, then press Enter here to continue...")
+                confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
+                        "No yourself, then press Enter here to continue...")
 
             await page.go_back()
             await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
 
         await browser.close()
+
+
+async def main():
+    profile = load_profile()
+    await run_automation(profile)
 
 
 if __name__ == "__main__":

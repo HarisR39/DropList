@@ -826,6 +826,85 @@ async def test_resolve_needs_review_interactively_handles_combobox(monkeypatch):
     assert profile["custom_answers"]["country"] == "United States"
 
 
+async def test_resolve_needs_review_interactively_uses_ask_fn_instead_of_input(monkeypatch):
+    # A GUI (or any other caller) supplies ask_fn to replace the terminal
+    # input() prompt entirely -- input() must not be touched when it's given.
+    def boom(prompt=""):
+        raise AssertionError("input() should not be called when ask_fn is provided")
+
+    monkeypatch.setattr("builtins.input", boom)
+    seen_items = []
+
+    def fake_ask_fn(item):
+        seen_items.append(item)
+        return "Relocation is fine"
+
+    page = FakePage()
+    profile = {**PROFILE}
+    needs_review = [{
+        "label": "Are you willing to relocate to Austin specifically?",
+        "reasoning": "not in profile",
+        "field_id": "f0",
+        "selector": '[data-autofill-id="f0"]',
+        "type": "textarea",
+        "options": [],
+    }]
+
+    still_needs_review = await autofill._resolve_needs_review_interactively(
+        page, profile, needs_review, ask_fn=fake_ask_fn
+    )
+
+    assert still_needs_review == []
+    page.locator('[data-autofill-id="f0"]').fill.assert_awaited_once_with("Relocation is fine")
+    assert profile["custom_answers"]["are you willing to relocate to austin specifically?"] == "Relocation is fine"
+    # ask_fn must receive the full structured item (label/reasoning/type/options/...),
+    # not just a formatted prompt string, so a GUI can render it appropriately.
+    assert seen_items == [needs_review[0]]
+
+
+async def test_resolve_needs_review_interactively_ask_fn_blank_answer_skips():
+    page = FakePage()
+    profile = {**PROFILE}
+    needs_review = [{
+        "label": "Essay question",
+        "reasoning": "not in profile",
+        "field_id": "f0",
+        "selector": '[data-autofill-id="f0"]',
+        "type": "textarea",
+        "options": [],
+    }]
+
+    still_needs_review = await autofill._resolve_needs_review_interactively(
+        page, profile, needs_review, ask_fn=lambda item: ""
+    )
+
+    assert still_needs_review == needs_review
+    page.locator('[data-autofill-id="f0"]').fill.assert_not_awaited()
+    assert profile.get("custom_answers", {}) == {}
+
+
+async def test_multistep_passes_ask_fn_through_to_interactive_resolver(monkeypatch):
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
+    monkeypatch.setattr(
+        autofill, "autofill_form",
+        AsyncMock(return_value=AutofillResult(filled=[], needs_review=[{"label": "Essay", "reasoning": ""}], errors=[])),
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    interactive_resolver_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(autofill, "_resolve_needs_review_interactively", interactive_resolver_mock)
+
+    sentinel_ask_fn = lambda item: "answer"  # noqa: E731
+    page = FakePage()
+    await autofill.autofill_form_multistep(
+        page, PROFILE, resume_path="resume.pdf", max_steps=6, ask_fn=sentinel_ask_fn
+    )
+
+    interactive_resolver_mock.assert_awaited_once_with(
+        page, PROFILE, [{"label": "Essay", "reasoning": ""}], ask_fn=sentinel_ask_fn
+    )
+
+
 async def test_resolve_needs_review_interactively_skips_on_blank_answer(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
     page = FakePage()

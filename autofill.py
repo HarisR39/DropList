@@ -823,24 +823,35 @@ async def dismiss_cookie_banner(page: Page) -> bool:
 
 
 async def _resolve_needs_review_interactively(
-    page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]]
+    page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]],
+    ask_fn: Any = None,
 ) -> list[dict[str, Any]]:
     """Ask the user for anything Claude couldn't confidently answer, right while
     those fields are still live on the page, fill in whatever they provide, and
     remember it in profile['custom_answers'] so the same question on a future
-    application is answered automatically instead of asked again."""
+    application is answered automatically instead of asked again.
+
+    ask_fn, if given, is a synchronous callable(item_dict) -> str used instead
+    of the terminal print()/input() below -- e.g. a GUI-backed prompt that
+    blocks the calling thread until the user answers. It receives the same
+    item dict (label/reasoning/options/type/...) so the caller can render it
+    however it likes; an empty/blank return means "skip", same as pressing
+    Enter at the terminal prompt."""
     still_needs_review = []
     custom_answers = profile.setdefault("custom_answers", {})
 
     for item in needs_review:
         label = item["label"]
-        print(f"\nNeeds your input -- \"{label}\"")
-        if item.get("reasoning"):
-            print(f"  (reason: {item['reasoning']})")
-        if item.get("options"):
-            print(f"  Options: {', '.join(item['options'])}")
+        if ask_fn is not None:
+            answer = (ask_fn(item) or "").strip()
+        else:
+            print(f"\nNeeds your input -- \"{label}\"")
+            if item.get("reasoning"):
+                print(f"  (reason: {item['reasoning']})")
+            if item.get("options"):
+                print(f"  Options: {', '.join(item['options'])}")
+            answer = input("  Enter a value (or press Enter to skip / leave for manual review): ").strip()
 
-        answer = input("  Enter a value (or press Enter to skip / leave for manual review): ").strip()
         if not answer:
             still_needs_review.append(item)
             continue
@@ -900,6 +911,7 @@ async def autofill_form_multistep(
     screenshot_prefix: str = "form",
     interactive: bool = True,
     on_needs_review: Any = None,
+    ask_fn: Any = None,
 ) -> AutofillResult:
     """Fill a (possibly multi-step) application form, advancing through
     Next/Continue steps up to max_steps. Also handles landing pages with no
@@ -909,9 +921,12 @@ async def autofill_form_multistep(
     confidently answer and remembers the answer in profile['custom_answers'].
 
     on_needs_review, if given, is called with the list of needs_review items
-    right before blocking on the interactive terminal prompts -- e.g. to fire
-    a notification the moment the AI hands off to a human, since the prompts
-    themselves block until someone is actually there to answer them."""
+    right before blocking on the interactive prompts -- e.g. to fire a
+    notification the moment the AI hands off to a human, since the prompts
+    themselves block until someone is actually there to answer them.
+
+    ask_fn, if given, is passed through to _resolve_needs_review_interactively
+    in place of the terminal input() prompt -- see its docstring."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -955,7 +970,9 @@ async def autofill_form_multistep(
         if remaining_needs_review and on_needs_review is not None:
             on_needs_review(remaining_needs_review)
         if interactive and remaining_needs_review:
-            remaining_needs_review = await _resolve_needs_review_interactively(page, profile, remaining_needs_review)
+            remaining_needs_review = await _resolve_needs_review_interactively(
+                page, profile, remaining_needs_review, ask_fn=ask_fn
+            )
 
         all_filled.extend(result.filled)
         all_needs_review.extend(remaining_needs_review)
