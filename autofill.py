@@ -825,6 +825,7 @@ async def dismiss_cookie_banner(page: Page) -> bool:
 async def _resolve_needs_review_interactively(
     page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]],
     ask_fn: Any = None,
+    on_frame: Any = None,
 ) -> list[dict[str, Any]]:
     """Ask the user for anything Claude couldn't confidently answer, right while
     those fields are still live on the page, fill in whatever they provide, and
@@ -836,12 +837,18 @@ async def _resolve_needs_review_interactively(
     blocks the calling thread until the user answers. It receives the same
     item dict (label/reasoning/options/type/...) so the caller can render it
     however it likes; an empty/blank return means "skip", same as pressing
-    Enter at the terminal prompt."""
+    Enter at the terminal prompt.
+
+    on_frame, if given, is a synchronous callable(jpeg_bytes) called with a
+    fresh screenshot right before each item is presented -- e.g. to update a
+    live view of the page the user is being asked about."""
     still_needs_review = []
     custom_answers = profile.setdefault("custom_answers", {})
 
     for item in needs_review:
         label = item["label"]
+        if on_frame is not None:
+            on_frame(await page.screenshot(type="jpeg", quality=60))
         if ask_fn is not None:
             answer = (ask_fn(item) or "").strip()
         else:
@@ -901,6 +908,22 @@ async def _resolve_needs_review_interactively(
     return still_needs_review
 
 
+async def _capture_frame(
+    page: Page, screenshot_dir: str | None, screenshot_prefix: str, step: int, suffix: str,
+    on_frame: Any,
+) -> None:
+    """Take one screenshot and route it to whichever of disk / on_frame are
+    wanted, instead of capturing twice for the same checkpoint."""
+    if not screenshot_dir and on_frame is None:
+        return
+    frame_bytes = await page.screenshot(type="jpeg", quality=60)
+    if screenshot_dir:
+        with open(f"{screenshot_dir}/{screenshot_prefix}_step{step}_{suffix}.jpg", "wb") as f:
+            f.write(frame_bytes)
+    if on_frame is not None:
+        on_frame(frame_bytes)
+
+
 async def autofill_form_multistep(
     page: Page,
     profile: dict[str, Any],
@@ -912,6 +935,7 @@ async def autofill_form_multistep(
     interactive: bool = True,
     on_needs_review: Any = None,
     ask_fn: Any = None,
+    on_frame: Any = None,
 ) -> AutofillResult:
     """Fill a (possibly multi-step) application form, advancing through
     Next/Continue steps up to max_steps. Also handles landing pages with no
@@ -926,7 +950,11 @@ async def autofill_form_multistep(
     themselves block until someone is actually there to answer them.
 
     ask_fn, if given, is passed through to _resolve_needs_review_interactively
-    in place of the terminal input() prompt -- see its docstring."""
+    in place of the terminal input() prompt -- see its docstring.
+
+    on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
+    at each point one's already being taken (before/after each step, before
+    each per-field prompt) -- e.g. to drive a live view of the page."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -962,8 +990,7 @@ async def autofill_form_multistep(
         if not fields:
             break
 
-        if screenshot_dir:
-            await page.screenshot(path=f"{screenshot_dir}/{screenshot_prefix}_step{step}_before.png")
+        await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
 
         result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields)
         remaining_needs_review = result.needs_review
@@ -971,15 +998,14 @@ async def autofill_form_multistep(
             on_needs_review(remaining_needs_review)
         if interactive and remaining_needs_review:
             remaining_needs_review = await _resolve_needs_review_interactively(
-                page, profile, remaining_needs_review, ask_fn=ask_fn
+                page, profile, remaining_needs_review, ask_fn=ask_fn, on_frame=on_frame
             )
 
         all_filled.extend(result.filled)
         all_needs_review.extend(remaining_needs_review)
         all_errors.extend(result.errors)
 
-        if screenshot_dir:
-            await page.screenshot(path=f"{screenshot_dir}/{screenshot_prefix}_step{step}_after.png")
+        await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "after", on_frame)
 
         next_button = await find_next_button(page)
         if next_button is None:

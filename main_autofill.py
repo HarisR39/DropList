@@ -556,6 +556,73 @@ async def test_needs_review_field_is_skipped_not_guessed(monkeypatch):
 SOME_FIELDS = [FormField("f0", "Some Field", "text", '[data-autofill-id="f0"]')]
 
 
+async def test_capture_frame_calls_on_frame_with_screenshot_bytes(tmp_path):
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+    frames = []
+
+    await autofill._capture_frame(page, None, "form", 0, "before", frames.append)
+
+    page.screenshot.assert_awaited_once_with(type="jpeg", quality=60)
+    assert frames == [b"fake-jpeg-bytes"]
+
+
+async def test_capture_frame_writes_to_disk_when_screenshot_dir_given(tmp_path):
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+
+    await autofill._capture_frame(page, str(tmp_path), "job_123", 2, "after", None)
+
+    written = tmp_path / "job_123_step2_after.jpg"
+    assert written.read_bytes() == b"fake-jpeg-bytes"
+
+
+async def test_capture_frame_skips_screenshot_when_nothing_wants_it():
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+
+    await autofill._capture_frame(page, None, "form", 0, "before", None)
+
+    page.screenshot.assert_not_awaited()
+
+
+async def test_resolve_needs_review_interactively_calls_on_frame_per_item():
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"frame-bytes")
+    frames = []
+    needs_review = [
+        {"label": "Q1", "reasoning": "", "field_id": "f0", "selector": '[data-autofill-id="f0"]', "type": "text", "options": []},
+        {"label": "Q2", "reasoning": "", "field_id": "f1", "selector": '[data-autofill-id="f1"]', "type": "text", "options": []},
+    ]
+
+    await autofill._resolve_needs_review_interactively(
+        page, {**PROFILE}, needs_review, ask_fn=lambda item: "", on_frame=frames.append
+    )
+
+    assert frames == [b"frame-bytes", b"frame-bytes"]
+
+
+async def test_multistep_passes_on_frame_through_to_interactive_resolver(monkeypatch):
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
+    monkeypatch.setattr(
+        autofill, "autofill_form",
+        AsyncMock(return_value=AutofillResult(filled=[], needs_review=[{"label": "Essay", "reasoning": ""}], errors=[])),
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+    interactive_resolver_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(autofill, "_resolve_needs_review_interactively", interactive_resolver_mock)
+
+    sentinel_on_frame = lambda frame_bytes: None  # noqa: E731
+    page = FakePage()
+    await autofill.autofill_form_multistep(
+        page, PROFILE, resume_path="resume.pdf", max_steps=6, on_frame=sentinel_on_frame
+    )
+
+    interactive_resolver_mock.assert_awaited_once_with(
+        page, PROFILE, [{"label": "Essay", "reasoning": ""}], ask_fn=None, on_frame=sentinel_on_frame
+    )
+
+
 async def test_multistep_form_advances_and_stops_when_no_next_button(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
     step_results = [
@@ -901,7 +968,7 @@ async def test_multistep_passes_ask_fn_through_to_interactive_resolver(monkeypat
     )
 
     interactive_resolver_mock.assert_awaited_once_with(
-        page, PROFILE, [{"label": "Essay", "reasoning": ""}], ask_fn=sentinel_ask_fn
+        page, PROFILE, [{"label": "Essay", "reasoning": ""}], ask_fn=sentinel_ask_fn, on_frame=None
     )
 
 

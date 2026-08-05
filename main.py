@@ -47,6 +47,7 @@ async def run_automation(
     log: Callable[[str], None] = print,
     confirm_fn: Callable[[str], None] | None = None,
     ask_fn: Any = None,
+    on_frame: Callable[[bytes], None] | None = None,
     num_listings: int = NUM_LISTINGS_TO_REVIEW,
     max_steps: int = MAX_FORM_STEPS,
 ) -> None:
@@ -64,7 +65,11 @@ async def run_automation(
 
     ask_fn, if given, is passed through to autofill_form_multistep to replace
     the terminal prompt for fields the AI couldn't confidently answer -- see
-    autofill.autofill_form_multistep's docstring."""
+    autofill.autofill_form_multistep's docstring.
+
+    on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
+    right before each confirm() pause, in addition to the checkpoints already
+    covered inside autofill_form_multistep -- e.g. to drive a live view."""
     confirm = confirm_fn or (lambda prompt: input(prompt))
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
@@ -164,6 +169,7 @@ async def run_automation(
                             f"come back to the terminal."
                         ),
                         ask_fn=ask_fn,
+                        on_frame=on_frame,
                     )
                 except Exception as e:
                     log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
@@ -198,6 +204,8 @@ async def run_automation(
                     log(f"[{i + 1}/{num_listings}] All fields filled confidently.")
                     notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
 
+            if on_frame is not None and company_page is not None:
+                on_frame(await company_page.screenshot(type="jpeg", quality=60))
             confirm(f"[{i + 1}/{num_listings}] Review the form in the browser "
                     f"(check anything flagged above), then submit manually if it looks right. "
                     f"Press Enter to continue...")
@@ -207,6 +215,8 @@ async def run_automation(
             # script's, and leaving it open can block the next listing's clicks.
             did_you_apply = page.get_by_text("Did you apply", exact=False)
             if await did_you_apply.count() > 0:
+                if on_frame is not None:
+                    on_frame(await page.screenshot(type="jpeg", quality=60))
                 confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
                         "No yourself, then press Enter here to continue...")
 

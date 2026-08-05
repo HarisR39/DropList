@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DropList</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --text-dim: #9aa1ad;
+    --accent: #6d8cff;
+    --accent-hover: #8aa2ff;
+    --danger: #ff6b6b;
+    --ok: #46d19e;
+    --warn: #ffb84d;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--text-dim); display: inline-block; margin-right: 6px;
+  }
+  .status-dot.running { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .status-dot.error { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+  #status-text { color: var(--text-dim); font-size: 13px; }
+  .spacer { flex: 1; }
+  button {
+    font: inherit; border: none; border-radius: 8px; padding: 9px 16px;
+    cursor: pointer; font-weight: 600; font-size: 13px;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .btn-primary { background: var(--accent); color: #0b0d12; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+  .btn-danger:hover:not(:disabled) { background: rgba(255,107,107,0.1); }
+  .btn-secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover:not(:disabled) { background: #262b36; }
+
+  main {
+    display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px;
+    padding: 16px; height: calc(100vh - 57px);
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .panel-title {
+    padding: 10px 14px; font-size: 12px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--text-dim); border-bottom: 1px solid var(--border);
+  }
+  #view-wrap {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #05070a; overflow: hidden; position: relative;
+  }
+  #view-img { max-width: 100%; max-height: 100%; display: none; }
+  #view-placeholder { color: var(--text-dim); font-size: 13px; text-align: center; padding: 20px; }
+
+  #log {
+    flex: 1; overflow-y: auto; padding: 10px 14px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #log div { padding: 1px 0; }
+
+  #review-panel {
+    display: none; flex-direction: column; gap: 10px; padding: 14px 16px;
+    border-top: 1px solid var(--border); background: var(--panel-2);
+  }
+  #review-panel.visible { display: flex; }
+  #review-label { font-size: 14px; font-weight: 600; }
+  #review-reason { font-size: 12px; color: var(--text-dim); }
+  #review-options { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+  #review-options label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  #review-text {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit; font-size: 13px;
+  }
+  textarea#review-text { min-height: 70px; resize: vertical; }
+  #review-actions { display: flex; gap: 8px; }
+
+  #confirm-banner {
+    display: none; align-items: center; gap: 12px; padding: 12px 16px;
+    border-top: 1px solid var(--border); background: var(--panel-2);
+  }
+  #confirm-banner.visible { display: flex; }
+  #confirm-text { flex: 1; font-size: 13px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>DropList</h1>
+    <span><span id="status-dot" class="status-dot"></span><span id="status-text">idle</span></span>
+    <div class="spacer"></div>
+    <button id="start-btn" class="btn-primary">Start</button>
+    <button id="stop-btn" class="btn-danger" disabled>Stop</button>
+  </header>
+
+  <main>
+    <div class="panel">
+      <div class="panel-title">Live view</div>
+      <div id="view-wrap">
+        <img id="view-img" alt="live view">
+        <div id="view-placeholder">Nothing to show yet. Click Start.</div>
+      </div>
+      <div id="confirm-banner">
+        <div id="confirm-text"></div>
+        <button id="confirm-btn" class="btn-primary">Continue</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Log</div>
+      <div id="log"></div>
+      <div id="review-panel">
+        <div id="review-label"></div>
+        <div id="review-reason"></div>
+        <div id="review-options"></div>
+        <div id="review-actions">
+          <button id="review-submit" class="btn-primary">Submit</button>
+          <button id="review-skip" class="btn-secondary">Skip</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+<script>
+const logEl = document.getElementById("log");
+const viewImg = document.getElementById("view-img");
+const viewPlaceholder = document.getElementById("view-placeholder");
+const statusDot = document.getElementById("status-dot");
+const statusText = document.getElementById("status-text");
+const startBtn = document.getElementById("start-btn");
+const stopBtn = document.getElementById("stop-btn");
+const confirmBanner = document.getElementById("confirm-banner");
+const confirmText = document.getElementById("confirm-text");
+const confirmBtn = document.getElementById("confirm-btn");
+const reviewPanel = document.getElementById("review-panel");
+const reviewLabel = document.getElementById("review-label");
+const reviewReason = document.getElementById("review-reason");
+const reviewOptions = document.getElementById("review-options");
+const reviewSubmit = document.getElementById("review-submit");
+const reviewSkip = document.getElementById("review-skip");
+
+let ws = null;
+let currentAskType = null;
+
+function appendLog(text) {
+  const line = document.createElement("div");
+  line.textContent = text;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(kind, text) {
+  statusDot.className = "status-dot" + (kind ? " " + kind : "");
+  statusText.textContent = text;
+}
+
+function setRunningUI(running) {
+  startBtn.disabled = running;
+  stopBtn.disabled = !running;
+}
+
+function showFrame(base64Data) {
+  viewImg.src = "data:image/jpeg;base64," + base64Data;
+  viewImg.style.display = "block";
+  viewPlaceholder.style.display = "none";
+}
+
+function showConfirm(prompt) {
+  confirmText.textContent = prompt;
+  confirmBanner.classList.add("visible");
+}
+
+function hideConfirm() {
+  confirmBanner.classList.remove("visible");
+}
+
+function showAsk(item) {
+  reviewLabel.textContent = item.label || "";
+  reviewReason.textContent = item.reasoning ? ("Reason: " + item.reasoning) : "";
+  reviewReason.style.display = item.reasoning ? "block" : "none";
+  reviewOptions.innerHTML = "";
+  currentAskType = item.type;
+  const options = item.options || [];
+
+  if ((item.type === "select" || item.type === "radio-group") && options.length) {
+    options.forEach((opt, i) => {
+      const id = "opt-" + i;
+      const label = document.createElement("label");
+      label.innerHTML = `<input type="radio" name="review-radio" value="${escapeAttr(opt)}" id="${id}"> ${escapeHtml(opt)}`;
+      reviewOptions.appendChild(label);
+    });
+  } else if (item.type === "checkbox-group" && options.length) {
+    options.forEach((opt, i) => {
+      const id = "chk-" + i;
+      const label = document.createElement("label");
+      label.innerHTML = `<input type="checkbox" value="${escapeAttr(opt)}" id="${id}" class="review-check"> ${escapeHtml(opt)}`;
+      reviewOptions.appendChild(label);
+    });
+  } else if (item.type === "textarea") {
+    const textarea = document.createElement("textarea");
+    textarea.id = "review-text";
+    reviewOptions.appendChild(textarea);
+  } else {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "review-text";
+    reviewOptions.appendChild(input);
+  }
+  reviewPanel.classList.add("visible");
+}
+
+function hideAsk() {
+  reviewPanel.classList.remove("visible");
+  reviewOptions.innerHTML = "";
+  currentAskType = null;
+}
+
+function collectAskAnswer() {
+  if (currentAskType === "select" || currentAskType === "radio-group") {
+    const checked = reviewOptions.querySelector("input[name='review-radio']:checked");
+    return checked ? checked.value : "";
+  }
+  if (currentAskType === "checkbox-group") {
+    const checked = Array.from(reviewOptions.querySelectorAll(".review-check:checked")).map(el => el.value);
+    return checked.join(", ");
+  }
+  const textEl = document.getElementById("review-text");
+  return textEl ? textEl.value.trim() : "";
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => setStatus(null, "connected");
+  ws.onclose = () => { setStatus("error", "disconnected"); setTimeout(connect, 1500); };
+  ws.onerror = () => {};
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case "state":
+        (msg.log_tail || []).forEach(appendLog);
+        if (msg.frame) showFrame(msg.frame);
+        setRunningUI(!!msg.running);
+        setStatus(msg.running ? "running" : null, msg.running ? "running" : "idle");
+        if (msg.pending) {
+          if (msg.pending.kind === "confirm") showConfirm(msg.pending.prompt);
+          else if (msg.pending.kind === "ask") showAsk(msg.pending.item);
+        }
+        break;
+      case "log":
+        appendLog(msg.text);
+        break;
+      case "frame":
+        showFrame(msg.data);
+        break;
+      case "confirm":
+        setRunningUI(true);
+        setStatus("running", "waiting for you");
+        showConfirm(msg.prompt);
+        break;
+      case "ask":
+        setRunningUI(true);
+        setStatus("running", "waiting for you");
+        showAsk(msg.item);
+        break;
+      case "finished":
+        appendLog(msg.text);
+        setRunningUI(false);
+        setStatus(null, "idle");
+        hideConfirm();
+        hideAsk();
+        break;
+      case "error":
+        appendLog("ERROR: " + msg.text);
+        setRunningUI(false);
+        setStatus("error", "error");
+        hideConfirm();
+        hideAsk();
+        break;
+    }
+  };
+}
+
+startBtn.addEventListener("click", async () => {
+  const resp = await fetch("/start", { method: "POST" });
+  if (resp.ok) {
+    setRunningUI(true);
+    setStatus("running", "running");
+  } else {
+    const body = await resp.json().catch(() => ({}));
+    appendLog("Couldn't start: " + (body.error || resp.statusText));
+  }
+});
+
+stopBtn.addEventListener("click", async () => {
+  await fetch("/stop", { method: "POST" });
+});
+
+confirmBtn.addEventListener("click", () => {
+  hideConfirm();
+  ws.send(JSON.stringify({ type: "confirm_response" }));
+});
+
+reviewSubmit.addEventListener("click", () => {
+  const answer = collectAskAnswer();
+  hideAsk();
+  ws.send(JSON.stringify({ type: "ask_response", answer }));
+});
+
+reviewSkip.addEventListener("click", () => {
+  hideAsk();
+  ws.send(JSON.stringify({ type: "ask_response", answer: "" }));
+});
+
+connect();
+</script>
+</body>
+</html>
