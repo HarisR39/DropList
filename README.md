@@ -14,8 +14,18 @@ A personal automation tool that logs into [jobright.ai](https://jobright.ai), wa
    - Hidden/invisible junk (reCAPTCHA fields, shadow validation inputs, submit buttons) filtered out
 5. Sends the field set + your profile to an LLM (local via [Ollama](https://ollama.com) by default, or Anthropic's Claude API) to map each field to a value, batching large forms so the model doesn't choke on 50+ fields at once.
 6. Fills the form via Playwright, with safety nets at every step: dropdown values are validated against the real options (falling back to a catch-all "Other"/"Not Listed" option when one exists), and anything the model can't confidently answer — or that doesn't match any real option — is flagged instead of guessed.
-7. Anything flagged gets asked about interactively in the terminal, filled in live, and remembered (`profile.json`'s `custom_answers`) so the same question on a future application is answered automatically. A push notification (see below) fires the moment the AI hands off, since those prompts block until you're actually there to answer them.
+7. Anything flagged gets asked about interactively — in the web GUI (see below) or the terminal — filled in live, and remembered (`profile.json`'s `custom_answers`) so the same question on a future application is answered automatically. A push notification (see below) fires the moment the AI hands off, since those prompts block until you're actually there to answer them.
 8. Pauses for you to review the filled form and submit it yourself. Nothing is ever auto-submitted.
+
+## Web GUI
+
+`webapp.py` runs the same automation behind a small local FastAPI app instead of the bare terminal script, so you can watch it work and answer prompts from a browser tab:
+
+```bash
+python webapp.py
+```
+
+Then open `http://127.0.0.1:8765/`. Click **Start** to launch a run; the page streams the log, periodic screenshots of the actual browser window (Chromium itself doesn't run embedded in the page — a screenshot is pushed in at each checkpoint instead of the terminal's log line), and any "needs review" or "did you apply?" prompts as they come up, all over a WebSocket. It's loopback-only with no auth, since this is a single-user local tool.
 
 ## Notifications
 
@@ -60,7 +70,8 @@ On Windows, `setx` only takes effect in terminals/processes started *after* it r
 ## Running it
 
 ```bash
-python main.py
+python main.py       # plain terminal script
+python webapp.py     # web GUI at http://127.0.0.1:8765/
 ```
 
 Adjust `NUM_LISTINGS_TO_REVIEW` and `MAX_FORM_STEPS` at the top of `main.py` to control how many listings to process per run and how many steps a multi-step form is allowed to take.
@@ -71,20 +82,23 @@ Adjust `NUM_LISTINGS_TO_REVIEW` and `MAX_FORM_STEPS` at the top of `main.py` to 
 pytest
 ```
 
-52 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, dynamic/bare "Apply" button detection, mapping cache, batching and per-batch failure isolation, and the interactive review flow (including the notification callback).
+69 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, dynamic/bare "Apply" button detection, mapping cache, batching and per-batch failure isolation, the interactive review flow (including the notification callback), and the web GUI's bridge/WebSocket layer (streaming, start/stop, reconnect mid-prompt).
 
 ## Project layout
 
 - `main.py` — the runnable script: login, navigation, review loop.
+- `webapp.py` — FastAPI web GUI: runs the same automation in a background thread and streams it to a browser tab over WebSocket.
+- `static/index.html` — the web GUI's single-page frontend.
 - `autofill.py` — the actual engine: field extraction, LLM mapping, form filling, multi-step handling.
 - `mapping_cache.py` — local JSON cache of LLM field mappings, keyed by domain + field-set hash.
 - `application_tracking.py` — local JSON record of what's been applied to and what still needs review.
 - `profile.json` (gitignored) / `profile.example.json` (template) — candidate profile data.
 - `main_autofill.py` — the pytest suite for `autofill.py`.
+- `test_webapp.py` — the pytest suite for `webapp.py`.
 
 ## Tech stack
 
-Python (asyncio), Playwright, Ollama, Anthropic API, pytest/pytest-asyncio. No database — local JSON files for caching and tracking state.
+Python (asyncio), Playwright, FastAPI/Starlette/uvicorn (web GUI), Ollama, Anthropic API, pytest/pytest-asyncio. No database — local JSON files for caching and tracking state.
 
 ## A few honest caveats
 
