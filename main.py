@@ -80,7 +80,10 @@ async def run_automation(
         await page.get_by_text("Sign In", exact=False).first.click()
         await page.fill("#basic_email", os.environ["JOBRIGHT_EMAIL"])
         await page.fill("#basic_password", os.environ["JOBRIGHT_PASSWORD"])
-        await page.get_by_role("button", name="SIGN IN", exact=True).click()
+        # The header's own "Sign In" button (which we just clicked to open this
+        # form) is still on the page and also matches role=button name="SIGN IN" --
+        # scope to the login form itself (#basic) to hit the real submit button.
+        await page.locator("#basic").get_by_role("button", name="SIGN IN", exact=True).click()
         await page.wait_for_url("**/jobs/recommend**", timeout=15000)
         await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
 
@@ -170,6 +173,7 @@ async def run_automation(
                         ),
                         ask_fn=ask_fn,
                         on_frame=on_frame,
+                        log=log,
                     )
                 except Exception as e:
                     log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "

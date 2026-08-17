@@ -387,13 +387,20 @@ def get_mappings(fields: list[FormField], profile: dict[str, Any]) -> list[dict[
     return parsed["mappings"]
 
 
-def get_mappings_cached(fields: list[FormField], profile: dict[str, Any], domain: str) -> list[dict[str, Any]]:
+def get_mappings_cached(
+    fields: list[FormField], profile: dict[str, Any], domain: str, log: Any = print
+) -> list[dict[str, Any]]:
     """Same as get_mappings, but (a) splits large field lists into smaller
     batches -- local models start dropping/misnaming JSON keys on very large
     forms (seen: an 87-field Lever form producing valid JSON missing the
     "mappings" key entirely) -- and (b) caches (and can fail) per batch, so
     one bad batch doesn't lose mappings the rest of the form already got
-    right, and a retry doesn't have to redo batches that already succeeded."""
+    right, and a retry doesn't have to redo batches that already succeeded.
+
+    log(), if given, replaces plain print() for progress/failure messages --
+    see main.run_automation's docstring. Runs off the main thread (via
+    asyncio.to_thread), so log must be safe to call from a worker thread;
+    the queue.Queue-backed bridge in webapp.py already is."""
     all_mappings: list[dict[str, Any]] = []
     batches = [fields[i:i + MAPPING_BATCH_SIZE] for i in range(0, len(fields), MAPPING_BATCH_SIZE)]
 
@@ -405,14 +412,14 @@ def get_mappings_cached(fields: list[FormField], profile: dict[str, Any], domain
             continue
 
         if len(batches) > 1:
-            print(f"  Batch {batch_num}/{len(batches)} ({len(batch)} field(s))...")
+            log(f"  Batch {batch_num}/{len(batches)} ({len(batch)} field(s))...")
         try:
             batch_mappings = get_mappings(batch, profile)
         except Exception as e:
-            print(f"  Batch {batch_num}/{len(batches)} failed ({e}); flagging its fields for manual review.")
+            log(f"  Batch {batch_num}/{len(batches)} failed ({e}); flagging its fields for manual review.")
             batch_mappings = [
                 {"field_id": f.field_id, "value": None, "needs_review": True,
-                 "reasoning": "LLM mapping call failed or returned malformed JSON for this batch"}
+                 "reasoning": f"LLM mapping call failed or returned malformed JSON for this batch ({e})"}
                 for f in batch
             ]
         else:
@@ -699,6 +706,7 @@ async def autofill_form(
     resume_path: str,
     cover_letter_path: str | None = None,
     fields: list[FormField] | None = None,
+    log: Any = print,
 ) -> AutofillResult:
     if fields is None:
         fields = await extract_fields(page)
@@ -713,34 +721,34 @@ async def autofill_form(
     mappings = account_mappings + custom_mappings
     if remaining:
         domain = urlparse(page.url).netloc
-        mappings.extend(await _get_mappings_with_timeout(remaining, profile, domain))
+        mappings.extend(await _get_mappings_with_timeout(remaining, profile, domain, log))
 
     return await apply_mapping(page, fields, mappings, resume_path, cover_letter_path)
 
 
 async def _get_mappings_with_timeout(
-    fields: list[FormField], profile: dict[str, Any], domain: str
+    fields: list[FormField], profile: dict[str, Any], domain: str, log: Any = print
 ) -> list[dict[str, Any]]:
-    """Run the (blocking) LLM mapping call off the event loop, print progress
+    """Run the (blocking) LLM mapping call off the event loop, log progress
     so a slow local model doesn't look like a hang, and give up gracefully
     (flagging for manual review) instead of blocking forever."""
     num_batches = max(1, -(-len(fields) // MAPPING_BATCH_SIZE))  # ceil div
     timeout = max(LLM_TIMEOUT_SECONDS, num_batches * PER_BATCH_TIMEOUT_SECONDS)
-    print(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
-          f"({num_batches} batch(es))...")
+    log(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
+        f"({num_batches} batch(es))...")
     start = time.time()
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(get_mappings_cached, fields, profile, domain),
+            asyncio.to_thread(get_mappings_cached, fields, profile, domain, log),
             timeout=timeout,
         )
-        print(f"  Got mappings in {time.time() - start:.1f}s.")
+        log(f"  Got mappings in {time.time() - start:.1f}s.")
         return result
     except asyncio.TimeoutError:
-        print(f"  Timed out after {timeout}s waiting for {LLM_PROVIDER}; "
-              f"flagging these fields for manual review.")
+        log(f"  Timed out after {timeout}s waiting for {LLM_PROVIDER}; "
+            f"flagging these fields for manual review.")
     except Exception as e:
-        print(f"  Mapping call failed ({e}); flagging these fields for manual review.")
+        log(f"  Mapping call failed ({e}); flagging these fields for manual review.")
 
     return [
         {"field_id": f.field_id, "value": None, "needs_review": True, "reasoning": "LLM mapping call failed or timed out"}
@@ -936,6 +944,7 @@ async def autofill_form_multistep(
     on_needs_review: Any = None,
     ask_fn: Any = None,
     on_frame: Any = None,
+    log: Any = print,
 ) -> AutofillResult:
     """Fill a (possibly multi-step) application form, advancing through
     Next/Continue steps up to max_steps. Also handles landing pages with no
@@ -954,7 +963,11 @@ async def autofill_form_multistep(
 
     on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
     at each point one's already being taken (before/after each step, before
-    each per-field prompt) -- e.g. to drive a live view of the page."""
+    each per-field prompt) -- e.g. to drive a live view of the page.
+
+    log, if given, replaces plain print() for mapping progress/failure
+    messages, so a GUI backed by a log() callback (e.g. webapp.py) actually
+    sees why a batch failed instead of it only landing in the terminal."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -992,7 +1005,7 @@ async def autofill_form_multistep(
 
         await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
 
-        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields)
+        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields, log=log)
         remaining_needs_review = result.needs_review
         if remaining_needs_review and on_needs_review is not None:
             on_needs_review(remaining_needs_review)
