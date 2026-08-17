@@ -1,3 +1,4 @@
+import asyncio
 import threading
 
 from fastapi.testclient import TestClient
@@ -182,3 +183,59 @@ def test_reconnect_mid_pending_ask_replays_state(monkeypatch):
             assert msg == {"type": "log", "text": "got answer: answered after reconnect"}
             msg = ws2.receive_json()
             assert msg == {"type": "finished", "text": "Run finished."}
+
+
+def test_reset_when_nothing_running_just_starts(monkeypatch):
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+    app = webapp.create_app(run_automation_fn=fake_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+
+            resp = client.post("/reset")
+            assert resp.status_code == 200
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "starting"}
+
+
+def test_reset_restarts_a_run_stuck_on_confirm(monkeypatch):
+    # Proves the stop()-unblocks-pending fix: without it, a run blocked on
+    # confirm_fn's response.get() can never actually be cancelled (the
+    # worker's event loop has no chance to process the scheduled
+    # cancellation), so reset() would time out and this would fail.
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+    calls = {"count": 0}
+
+    async def counting_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                   num_listings=5, max_steps=6):
+        calls["count"] += 1
+        n = calls["count"]
+        log(f"run {n} starting")
+        confirm_fn("blocking forever until reset")
+        await asyncio.sleep(10)  # would time the test out if not actually cancelled
+        log(f"run {n} finished")
+
+    app = webapp.create_app(run_automation_fn=counting_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+            client.post("/start")
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "run 1 starting"}
+            msg = ws.receive_json()
+            assert msg == {"type": "confirm", "prompt": "blocking forever until reset"}
+
+            resp = client.post("/reset")
+            assert resp.status_code == 200
+
+            msg = ws.receive_json()
+            assert msg["type"] == "finished"
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "run 2 starting"}
+            msg = ws.receive_json()
+            assert msg == {"type": "confirm", "prompt": "blocking forever until reset"}
+
+            client.post("/stop")

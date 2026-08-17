@@ -107,6 +107,7 @@
     <span><span id="status-dot" class="status-dot"></span><span id="status-text">idle</span></span>
     <div class="spacer"></div>
     <button id="start-btn" class="btn-primary">Start</button>
+    <button id="reset-btn" class="btn-secondary">Reset</button>
     <button id="stop-btn" class="btn-danger" disabled>Stop</button>
   </header>
 
@@ -145,6 +146,7 @@ const viewPlaceholder = document.getElementById("view-placeholder");
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
 const startBtn = document.getElementById("start-btn");
+const resetBtn = document.getElementById("reset-btn");
 const stopBtn = document.getElementById("stop-btn");
 const confirmBanner = document.getElementById("confirm-banner");
 const confirmText = document.getElementById("confirm-text");
@@ -315,6 +317,22 @@ startBtn.addEventListener("click", async () => {
 
 stopBtn.addEventListener("click", async () => {
   await fetch("/stop", { method: "POST" });
+});
+
+resetBtn.addEventListener("click", async () => {
+  logEl.innerHTML = "";
+  viewImg.style.display = "none";
+  viewPlaceholder.style.display = "block";
+  hideConfirm();
+  hideAsk();
+  const resp = await fetch("/reset", { method: "POST" });
+  if (resp.ok) {
+    setRunningUI(true);
+    setStatus("running", "restarting");
+  } else {
+    const body = await resp.json().catch(() => ({}));
+    appendLog("Couldn't reset: " + (body.error || resp.statusText));
+  }
 });
 
 confirmBtn.addEventListener("click", () => {

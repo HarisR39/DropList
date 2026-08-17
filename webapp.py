@@ -121,8 +121,32 @@ class AutomationBridge:
     def stop(self) -> bool:
         if not self.is_running or self._loop is None or self._task is None:
             return False
+        if self._pending_response is not None:
+            # The worker thread may be blocked inside a synchronous
+            # confirm_fn/ask_fn wait (response.get() with no timeout) --
+            # that occupies the worker's event loop entirely, so the
+            # cancellation scheduled below has no chance to run until this
+            # unblocks it first. None is safe for both: confirm_fn ignores
+            # its return value, and ask_fn's caller already treats None like
+            # "no answer" (`ask_fn(item) or ""`).
+            self._pending_response.put(None)
         self._loop.call_soon_threadsafe(self._task.cancel)
         return True
+
+    async def reset(self) -> bool:
+        """Stop whatever's running (even mid-prompt, per stop() above) and
+        start a fresh run. Returns False if the previous run didn't actually
+        stop in time, so the caller doesn't end up with two automations
+        running (two Chromium instances) at once."""
+        if self.is_running:
+            self.stop()
+            for _ in range(150):  # ~15s
+                if not self.is_running:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                return False
+        return self.start()
 
     # ------------------------------------------------------- broadcasting ---
     # Runs on the app's own event loop (started once via lifespan).
@@ -224,6 +248,12 @@ def create_app(run_automation_fn=run_automation) -> FastAPI:
         if not bridge.stop():
             return JSONResponse({"error": "not running"}, status_code=400)
         return {"status": "stopping"}
+
+    @app.post("/reset")
+    async def reset_run():
+        if not await bridge.reset():
+            return JSONResponse({"error": "previous run didn't stop in time"}, status_code=500)
+        return {"status": "reset"}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket):
