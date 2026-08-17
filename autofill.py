@@ -105,6 +105,11 @@ Rules:
   it out as the word "Yes" or "No" in "value" — never the literal string "true"/"false",
   since real form options are worded that way, not as JSON booleans.
 - Keep generated free-text answers under 100 words unless the field specifies a length.
+- A profile's "first_name"/"last_name" are the candidate's legal name — use these for any
+  field labeled "First Name"/"Last Name"/"Full Name"/"Legal Name". Only use "preferred_name"
+  for a field that explicitly asks for a preferred name, nickname, chosen name, or "name you
+  go by" — never substitute it for a plain "First Name" field just because it's shorter or
+  more casual.
 
 Respond with ONLY valid JSON matching this schema, no preamble or markdown:
 {
