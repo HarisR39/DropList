@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -584,6 +584,55 @@ async def test_capture_frame_skips_screenshot_when_nothing_wants_it():
     await autofill._capture_frame(page, None, "form", 0, "before", None)
 
     page.screenshot.assert_not_awaited()
+
+
+async def test_take_frame_screenshot_falls_back_to_viewport_when_full_page_fails():
+    # Full-page screenshots can throw outright on very long/lazy-loaded forms
+    # (the browser has a max capturable canvas height) -- none of the on_frame
+    # call sites are wrapped in error handling upstream, so this must recover
+    # on its own instead of taking the whole run down over a screenshot.
+    page = FakePage()
+    page.screenshot = AsyncMock(side_effect=[Exception("full-page too tall"), b"viewport-bytes"])
+
+    result = await autofill.take_frame_screenshot(page)
+
+    assert result == b"viewport-bytes"
+    assert page.screenshot.await_args_list == [
+        call(type="jpeg", quality=60, full_page=True),
+        call(type="jpeg", quality=60),
+    ]
+
+
+async def test_take_frame_screenshot_gives_up_quietly_when_both_attempts_fail():
+    page = FakePage()
+    page.screenshot = AsyncMock(side_effect=Exception("no screenshot for you"))
+
+    result = await autofill.take_frame_screenshot(page)
+
+    assert result is None
+
+
+async def test_take_frame_screenshot_falls_back_when_full_page_returns_empty_bytes():
+    # Seen live on an extreme-height page: full_page=True "succeeds" with a
+    # 0-byte result instead of raising -- an empty result must be treated as
+    # a failure too, not just an exception.
+    page = FakePage()
+    page.screenshot = AsyncMock(side_effect=[b"", b"viewport-bytes"])
+
+    result = await autofill.take_frame_screenshot(page)
+
+    assert result == b"viewport-bytes"
+
+
+async def test_capture_frame_skips_on_frame_and_disk_write_when_screenshot_unavailable(tmp_path):
+    page = FakePage()
+    page.screenshot = AsyncMock(side_effect=Exception("no screenshot for you"))
+    frames = []
+
+    await autofill._capture_frame(page, str(tmp_path), "form", 0, "before", frames.append)
+
+    assert frames == []
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_resolve_needs_review_interactively_calls_on_frame_per_item():

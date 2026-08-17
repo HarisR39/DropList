@@ -861,7 +861,9 @@ async def _resolve_needs_review_interactively(
     for item in needs_review:
         label = item["label"]
         if on_frame is not None:
-            on_frame(await page.screenshot(type="jpeg", quality=60, full_page=True))
+            frame_bytes = await take_frame_screenshot(page)
+            if frame_bytes is not None:
+                on_frame(frame_bytes)
         if ask_fn is not None:
             answer = (ask_fn(item) or "").strip()
         else:
@@ -921,6 +923,32 @@ async def _resolve_needs_review_interactively(
     return still_needs_review
 
 
+async def take_frame_screenshot(page: Page) -> bytes | None:
+    """Full-page JPEG screenshot for a live view, with a safe fallback.
+    full_page=True can fail on very long/lazy-loaded forms (the browser has
+    a max capturable canvas height) -- and not always by raising: on an
+    extreme-height page it's been observed to "succeed" with a 0-byte
+    result instead of throwing, so an empty result is treated as a failure
+    too, not just an exception. None of this module's on_frame call sites
+    are wrapped in error handling upstream, so letting either failure mode
+    propagate would silently kill the whole automation run right after a
+    successful fill, not just skip one frame update. Fall back to a
+    viewport-only screenshot, and give up quietly (None) only if even that
+    comes back empty or fails, rather than ever taking the run down over a
+    screenshot."""
+    try:
+        frame = await page.screenshot(type="jpeg", quality=60, full_page=True)
+        if frame:
+            return frame
+    except Exception:
+        pass
+    try:
+        frame = await page.screenshot(type="jpeg", quality=60)
+        return frame or None
+    except Exception:
+        return None
+
+
 async def _capture_frame(
     page: Page, screenshot_dir: str | None, screenshot_prefix: str, step: int, suffix: str,
     on_frame: Any,
@@ -929,7 +957,9 @@ async def _capture_frame(
     wanted, instead of capturing twice for the same checkpoint."""
     if not screenshot_dir and on_frame is None:
         return
-    frame_bytes = await page.screenshot(type="jpeg", quality=60, full_page=True)
+    frame_bytes = await take_frame_screenshot(page)
+    if frame_bytes is None:
+        return
     if screenshot_dir:
         with open(f"{screenshot_dir}/{screenshot_prefix}_step{step}_{suffix}.jpg", "wb") as f:
             f.write(frame_bytes)

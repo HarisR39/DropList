@@ -7,7 +7,7 @@ from typing import Any, Callable
 from playwright.async_api import async_playwright
 
 import application_tracking
-from autofill import autofill_form_multistep
+from autofill import autofill_form_multistep, take_frame_screenshot
 
 NUM_LISTINGS_TO_REVIEW = 5
 MAX_FORM_STEPS = 6
@@ -213,7 +213,9 @@ async def run_automation(
                     notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
 
             if on_frame is not None and company_page is not None:
-                on_frame(await company_page.screenshot(type="jpeg", quality=60, full_page=True))
+                frame_bytes = await take_frame_screenshot(company_page)
+                if frame_bytes is not None:
+                    on_frame(frame_bytes)
             confirm(f"[{i + 1}/{num_listings}] Review the form in the browser "
                     f"(check anything flagged above), then submit manually if it looks right. "
                     f"Press Enter to continue...")
@@ -224,7 +226,9 @@ async def run_automation(
             did_you_apply = page.get_by_text("Did you apply", exact=False)
             if await did_you_apply.count() > 0:
                 if on_frame is not None:
-                    on_frame(await page.screenshot(type="jpeg", quality=60, full_page=True))
+                    frame_bytes = await take_frame_screenshot(page)
+                    if frame_bytes is not None:
+                        on_frame(frame_bytes)
                 apply_options = ["Yes, I applied!", "No, I didn't apply"]
                 if ask_fn is not None:
                     # GUI mode: answer it right from the review panel instead of
