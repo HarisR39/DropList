@@ -47,6 +47,8 @@ class FakePage:
         self.screenshot = AsyncMock()
         self.wait_for_load_state = AsyncMock()
         self.wait_for_timeout = AsyncMock()
+        self.keyboard = MagicMock()
+        self.keyboard.press = AsyncMock()
 
     def locator(self, selector: str) -> FakeLocator:
         if selector not in self._selector_locators:
@@ -940,6 +942,70 @@ async def test_resolve_needs_review_interactively_handles_combobox(monkeypatch):
     page.locator('[data-autofill-id="f0"]').fill.assert_not_awaited()
     option.click.assert_awaited_once()
     assert profile["custom_answers"]["country"] == "United States"
+
+
+async def test_peek_combobox_options_returns_visible_option_texts():
+    page = FakePage()
+    everything = page.set_role_button("option", None, count=2)
+    everything.all_inner_texts = AsyncMock(return_value=["Yes", "No"])
+
+    result = await autofill._peek_combobox_options(page, '[data-autofill-id="f0"]')
+
+    assert result == ["Yes", "No"]
+    page.locator('[data-autofill-id="f0"]').click.assert_awaited_once()
+    page.keyboard.press.assert_awaited_once_with("Escape")
+
+
+async def test_peek_combobox_options_returns_empty_list_when_nothing_open():
+    page = FakePage()  # no options registered -> default count=0 locator
+
+    result = await autofill._peek_combobox_options(page, '[data-autofill-id="f0"]')
+
+    assert result == []
+
+
+async def test_peek_combobox_options_swallows_errors():
+    page = FakePage()
+    page.locator('[data-autofill-id="f0"]').click = AsyncMock(side_effect=Exception("boom"))
+
+    result = await autofill._peek_combobox_options(page, '[data-autofill-id="f0"]')
+
+    assert result == []
+
+
+async def test_resolve_needs_review_interactively_peeks_combobox_when_options_unknown(monkeypatch):
+    # A search-to-type combobox always extracts with an empty options list --
+    # peek at whatever's rendered before presenting it, so the reviewer (GUI
+    # or terminal) gets a starting list instead of a blank text box.
+    peek_mock = AsyncMock(return_value=["Peeked A", "Peeked B"])
+    monkeypatch.setattr(autofill, "_peek_combobox_options", peek_mock)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    page = FakePage()
+    item = {
+        "label": "City", "reasoning": "", "field_id": "f0",
+        "selector": '[data-autofill-id="f0"]', "type": "combobox", "options": [],
+    }
+
+    still_needs_review = await autofill._resolve_needs_review_interactively(page, {**PROFILE}, [item])
+
+    peek_mock.assert_awaited_once_with(page, '[data-autofill-id="f0"]')
+    assert item["options"] == ["Peeked A", "Peeked B"]
+    assert still_needs_review == [item]
+
+
+async def test_resolve_needs_review_interactively_skips_peek_for_non_combobox(monkeypatch):
+    peek_mock = AsyncMock(return_value=["should not be used"])
+    monkeypatch.setattr(autofill, "_peek_combobox_options", peek_mock)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    page = FakePage()
+    item = {
+        "label": "Country", "reasoning": "", "field_id": "f0",
+        "selector": '[data-autofill-id="f0"]', "type": "select", "options": ["USA", "Canada"],
+    }
+
+    await autofill._resolve_needs_review_interactively(page, {**PROFILE}, [item])
+
+    peek_mock.assert_not_awaited()
 
 
 async def test_resolve_needs_review_interactively_uses_ask_fn_instead_of_input(monkeypatch):

@@ -91,6 +91,8 @@
     background: var(--bg); color: var(--text); font: inherit; font-size: 13px;
   }
   textarea#review-text { min-height: 70px; resize: vertical; }
+  #review-suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .suggestion-btn { padding: 5px 10px; font-size: 12px; font-weight: 500; }
   #review-actions { display: flex; gap: 8px; }
 
   #confirm-banner {
@@ -219,6 +221,29 @@ function showAsk(item) {
     const textarea = document.createElement("textarea");
     textarea.id = "review-text";
     reviewOptions.appendChild(textarea);
+  } else if (item.type === "combobox") {
+    // Search-to-type dropdowns don't have a fixed option list -- whatever
+    // the server peeked at is a starting point, not the full set, so this
+    // stays a free-text input with those as clickable suggestions rather
+    // than a fixed choice list like select/radio-group above.
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "review-text";
+    input.placeholder = options.length ? "Type to search, or pick a suggestion below" : "Type a value";
+    reviewOptions.appendChild(input);
+    if (options.length) {
+      const suggestions = document.createElement("div");
+      suggestions.id = "review-suggestions";
+      options.forEach(opt => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-secondary suggestion-btn";
+        btn.textContent = opt;
+        btn.addEventListener("click", () => { input.value = opt; input.focus(); });
+        suggestions.appendChild(btn);
+      });
+      reviewOptions.appendChild(suggestions);
+    }
   } else {
     const input = document.createElement("input");
     input.type = "text";

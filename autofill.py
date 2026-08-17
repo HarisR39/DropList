@@ -835,6 +835,38 @@ async def dismiss_cookie_banner(page: Page) -> bool:
     return False
 
 
+async def _peek_combobox_options(page: Page, selector: str) -> list[str]:
+    """Open a combobox and read whatever options are already rendered,
+    without typing or selecting anything -- a starting list to show a human
+    reviewer instead of a blank text box. Search-driven widgets (city,
+    school, country) render nothing until you type, so an empty result here
+    is expected and not itself a problem; short static lists (EEO-style
+    Yes/No/Decline questions) render everything immediately and this picks
+    those up. Best-effort -- any failure here just means no options shown,
+    never a reason to fail the review prompt itself.
+
+    Presses Escape afterward to close the widget back up -- select_combobox_
+    option() does its own click-to-open when the answer actually comes in,
+    and leaving this one open first could make that second click toggle it
+    closed instead, on widgets where the control is a click-to-toggle button
+    rather than a plain focus-to-open input."""
+    try:
+        await page.locator(selector).click(timeout=3000)
+        everything = page.get_by_role("option")
+        try:
+            await everything.first.wait_for(timeout=1500)
+        except Exception:
+            pass
+        texts = await everything.all_inner_texts()
+    except Exception:
+        return []
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return texts
+
+
 async def _resolve_needs_review_interactively(
     page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]],
     ask_fn: Any = None,
@@ -860,6 +892,8 @@ async def _resolve_needs_review_interactively(
 
     for item in needs_review:
         label = item["label"]
+        if item.get("type") == "combobox" and item.get("selector") and not item.get("options"):
+            item["options"] = await _peek_combobox_options(page, item["selector"])
         if on_frame is not None:
             frame_bytes = await take_frame_screenshot(page)
             if frame_bytes is not None:
