@@ -59,13 +59,17 @@ async def run_automation(
     view instead of (or alongside) the terminal.
 
     confirm_fn(prompt), if given, replaces the terminal input() calls that
-    just wait for acknowledgement (review-and-continue, the "did you apply?"
-    popup) -- called with a message, expected to block until the user
-    acknowledges, return value is ignored. Defaults to real input().
+    just wait for acknowledgement (review-and-continue pause; the "did you
+    apply?" popup when ask_fn isn't given) -- called with a message, expected
+    to block until the user acknowledges, return value is ignored. Defaults
+    to real input().
 
     ask_fn, if given, is passed through to autofill_form_multistep to replace
     the terminal prompt for fields the AI couldn't confidently answer -- see
-    autofill.autofill_form_multistep's docstring.
+    autofill.autofill_form_multistep's docstring. It's also used directly
+    here for the "did you apply?" popup: when given, its Yes/No answer is
+    clicked on the real popup automatically instead of asking you to click it
+    yourself in the browser window.
 
     on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
     right before each confirm() pause, in addition to the checkpoints already
@@ -221,8 +225,27 @@ async def run_automation(
             if await did_you_apply.count() > 0:
                 if on_frame is not None:
                     on_frame(await page.screenshot(type="jpeg", quality=60, full_page=True))
-                confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
-                        "No yourself, then press Enter here to continue...")
+                apply_options = ["Yes, I applied!", "No, I didn't apply"]
+                if ask_fn is not None:
+                    # GUI mode: answer it right from the review panel instead of
+                    # needing to click inside the raw (non-embedded) browser window.
+                    answer = (ask_fn({
+                        "label": "Did you apply?",
+                        "reasoning": "jobright is asking whether you actually submitted "
+                                     "the application on the company page.",
+                        "type": "radio-group",
+                        "options": apply_options,
+                    }) or "").strip()
+                    match = next((opt for opt in apply_options if opt.strip().lower() == answer.lower()), None)
+                    if match is not None:
+                        await page.get_by_text(match, exact=True).first.click()
+                        await page.wait_for_timeout(500)
+                    else:
+                        confirm("Couldn't match your answer to a button -- click Yes or "
+                                "No yourself in the browser, then press Enter here to continue...")
+                else:
+                    confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
+                            "No yourself, then press Enter here to continue...")
 
             await page.go_back()
             await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
