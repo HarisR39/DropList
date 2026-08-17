@@ -861,7 +861,7 @@ async def _resolve_needs_review_interactively(
     for item in needs_review:
         label = item["label"]
         if on_frame is not None:
-            on_frame(await page.screenshot(type="jpeg", quality=60))
+            on_frame(await page.screenshot(type="jpeg", quality=60, full_page=True))
         if ask_fn is not None:
             answer = (ask_fn(item) or "").strip()
         else:
@@ -929,7 +929,7 @@ async def _capture_frame(
     wanted, instead of capturing twice for the same checkpoint."""
     if not screenshot_dir and on_frame is None:
         return
-    frame_bytes = await page.screenshot(type="jpeg", quality=60)
+    frame_bytes = await page.screenshot(type="jpeg", quality=60, full_page=True)
     if screenshot_dir:
         with open(f"{screenshot_dir}/{screenshot_prefix}_step{step}_{suffix}.jpg", "wb") as f:
             f.write(frame_bytes)

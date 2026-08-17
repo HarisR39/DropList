@@ -209,7 +209,7 @@ async def run_automation(
                     notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
 
             if on_frame is not None and company_page is not None:
-                on_frame(await company_page.screenshot(type="jpeg", quality=60))
+                on_frame(await company_page.screenshot(type="jpeg", quality=60, full_page=True))
             confirm(f"[{i + 1}/{num_listings}] Review the form in the browser "
                     f"(check anything flagged above), then submit manually if it looks right. "
                     f"Press Enter to continue...")
@@ -220,7 +220,7 @@ async def run_automation(
             did_you_apply = page.get_by_text("Did you apply", exact=False)
             if await did_you_apply.count() > 0:
                 if on_frame is not None:
-                    on_frame(await page.screenshot(type="jpeg", quality=60))
+                    on_frame(await page.screenshot(type="jpeg", quality=60, full_page=True))
                 confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
                         "No yourself, then press Enter here to continue...")
 

@@ -563,7 +563,7 @@ async def test_capture_frame_calls_on_frame_with_screenshot_bytes(tmp_path):
 
     await autofill._capture_frame(page, None, "form", 0, "before", frames.append)
 
-    page.screenshot.assert_awaited_once_with(type="jpeg", quality=60)
+    page.screenshot.assert_awaited_once_with(type="jpeg", quality=60, full_page=True)
     assert frames == [b"fake-jpeg-bytes"]
 
 
