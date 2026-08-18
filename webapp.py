@@ -69,10 +69,10 @@ class AutomationBridge:
     def _log(self, message: str) -> None:
         self.events.put(("log", message))
 
-    def _confirm_fn(self, prompt: str) -> None:
+    def _confirm_fn(self, prompt: str, retryable: bool = False) -> str:
         response: queue.Queue = queue.Queue()
-        self.events.put(("confirm", prompt, response))
-        response.get()  # blocks the worker thread until the browser answers
+        self.events.put(("confirm", prompt, response, retryable))
+        return response.get()  # blocks the worker thread until the browser answers
 
     def _ask_fn(self, item: dict) -> str:
         response: queue.Queue = queue.Queue()
@@ -168,10 +168,10 @@ class AutomationBridge:
             self._last_frame = event[1]
             message = {"type": "frame", "data": event[1]}
         elif kind == "confirm":
-            _, prompt, response = event
-            self._pending = {"kind": "confirm", "prompt": prompt}
+            _, prompt, response, retryable = event
+            self._pending = {"kind": "confirm", "prompt": prompt, "retryable": retryable}
             self._pending_response = response
-            message = {"type": "confirm", "prompt": prompt}
+            message = {"type": "confirm", "prompt": prompt, "retryable": retryable}
         elif kind == "ask":
             _, item, response = event
             self._pending = {"kind": "ask", "item": item}
@@ -214,7 +214,7 @@ class AutomationBridge:
         response = self._pending_response
         self._pending = None
         self._pending_response = None
-        response.put(answer if kind == "ask" else None)
+        response.put(answer)
         return True
 
 
@@ -265,7 +265,7 @@ def create_app(run_automation_fn=run_automation) -> FastAPI:
                 data = await websocket.receive_json()
                 msg_type = data.get("type")
                 if msg_type == "confirm_response":
-                    bridge.submit_response("confirm")
+                    bridge.submit_response("confirm", data.get("action", "continue"))
                 elif msg_type == "ask_response":
                     bridge.submit_response("ask", data.get("answer", ""))
         except WebSocketDisconnect:

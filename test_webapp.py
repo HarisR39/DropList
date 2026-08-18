@@ -28,9 +28,10 @@ def test_bridge_confirm_fn_blocks_until_response():
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    kind, prompt, response = bridge.events.get(timeout=2)
+    kind, prompt, response, retryable = bridge.events.get(timeout=2)
     assert kind == "confirm"
     assert prompt == "please confirm"
+    assert retryable is False
     assert not done.is_set()  # still blocked
 
     response.put(None)
@@ -110,7 +111,7 @@ def test_start_streams_log_confirm_ask_finished(monkeypatch):
             assert msg["type"] == "frame"
 
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "please confirm"}
+            assert msg == {"type": "confirm", "prompt": "please confirm", "retryable": False}
 
             ws.send_json({"type": "confirm_response"})
 
@@ -225,7 +226,7 @@ def test_reset_restarts_a_run_stuck_on_confirm(monkeypatch):
             msg = ws.receive_json()
             assert msg == {"type": "log", "text": "run 1 starting"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "blocking forever until reset"}
+            assert msg == {"type": "confirm", "prompt": "blocking forever until reset", "retryable": False}
 
             resp = client.post("/reset")
             assert resp.status_code == 200
@@ -236,6 +237,51 @@ def test_reset_restarts_a_run_stuck_on_confirm(monkeypatch):
             msg = ws.receive_json()
             assert msg == {"type": "log", "text": "run 2 starting"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "blocking forever until reset"}
+            assert msg == {"type": "confirm", "prompt": "blocking forever until reset", "retryable": False}
 
             client.post("/stop")
+
+
+def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
+    # Mirrors main.run_automation's actual retry loop shape: a retryable
+    # confirm whose "retry" answer re-runs the fill step and asks again,
+    # only moving on once the answer is anything else.
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+    fill_count = {"n": 0}
+
+    async def retry_loop_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                     num_listings=5, max_steps=6):
+        while True:
+            fill_count["n"] += 1
+            log(f"filled attempt {fill_count['n']}")
+            action = confirm_fn("Review the form, or retry", retryable=True)
+            if (action or "").strip().lower() != "retry":
+                break
+        log("moving to next listing")
+
+    app = webapp.create_app(run_automation_fn=retry_loop_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+            client.post("/start")
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "filled attempt 1"}
+            msg = ws.receive_json()
+            assert msg == {"type": "confirm", "prompt": "Review the form, or retry", "retryable": True}
+
+            ws.send_json({"type": "confirm_response", "action": "retry"})
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "filled attempt 2"}
+            msg = ws.receive_json()
+            assert msg == {"type": "confirm", "prompt": "Review the form, or retry", "retryable": True}
+
+            ws.send_json({"type": "confirm_response", "action": "continue"})
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "moving to next listing"}
+            msg = ws.receive_json()
+            assert msg == {"type": "finished", "text": "Run finished."}
+
+            assert fill_count["n"] == 2

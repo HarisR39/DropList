@@ -58,10 +58,15 @@ async def run_automation(
     log() replaces plain print() so a GUI can route status text into its own
     view instead of (or alongside) the terminal.
 
-    confirm_fn(prompt), if given, replaces the terminal input() calls that
-    just wait for acknowledgement (review-and-continue pause; the "did you
-    apply?" popup when ask_fn isn't given) -- called with a message, expected
-    to block until the user acknowledges, return value is ignored. Defaults
+    confirm_fn(prompt, retryable=False), if given, replaces the terminal
+    input() calls that just wait for acknowledgement (review-and-continue
+    pause; the "did you apply?" popup when ask_fn isn't given) -- called with
+    a message, expected to block until the user responds. retryable=True only
+    for the review-and-continue pause; a response of "retry" (case-
+    insensitive, whitespace-trimmed) there re-runs autofill on the same page
+    from scratch instead of moving on -- e.g. after manually dismissing a
+    popup that got in the AI's way. Any other response (including the
+    default terminal input()'s usual blank Enter) means continue. Defaults
     to real input().
 
     ask_fn, if given, is passed through to autofill_form_multistep to replace
@@ -74,7 +79,7 @@ async def run_automation(
     on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
     right before each confirm() pause, in addition to the checkpoints already
     covered inside autofill_form_multistep -- e.g. to drive a live view."""
-    confirm = confirm_fn or (lambda prompt: input(prompt))
+    confirm = confirm_fn or (lambda prompt, retryable=False: input(prompt))
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
     async with async_playwright() as p:
@@ -149,76 +154,92 @@ async def run_automation(
                 log(f"[{i + 1}/{num_listings}] No resume-customize popup or new tab appeared; "
                     f"check the browser window.")
 
-            if company_page is not None:
-                # let redirects/dynamic content settle before reading the form.
-                # Some career sites never go fully network-idle (analytics beacons,
-                # chat widgets, etc.), so don't let that hang/kill the whole run.
-                try:
-                    await company_page.wait_for_load_state("networkidle", timeout=8000)
-                except Exception:
-                    pass
-                await company_page.wait_for_timeout(1500)
+            # Loops back only on an explicit "retry" response from the review
+            # pause below -- e.g. you noticed a popup got in the AI's way,
+            # dismissed it yourself in the browser, and want a fresh full
+            # autofill pass on this same page rather than moving on. Runs
+            # exactly once (no retry offered) if there's no company page.
+            while True:
+                if company_page is not None:
+                    # let redirects/dynamic content settle before reading the form.
+                    # Some career sites never go fully network-idle (analytics
+                    # beacons, chat widgets, etc.), so don't let that hang/kill
+                    # the whole run.
+                    try:
+                        await company_page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    await company_page.wait_for_timeout(1500)
 
-                try:
-                    result = await autofill_form_multistep(
-                        company_page,
-                        profile,
-                        profile["resume_path"],
-                        profile.get("cover_letter_path"),
-                        max_steps=max_steps,
-                        screenshot_dir=SCREENSHOT_DIR,
-                        screenshot_prefix=f"job_{job_id}",
-                        # The interactive prompts below block until someone is
-                        # actually there to answer them -- notify the moment the
-                        # AI hands off, not only after all of them are answered.
-                        on_needs_review=lambda items: notify(
-                            f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
-                            f"come back to the terminal."
-                        ),
-                        ask_fn=ask_fn,
-                        on_frame=on_frame,
-                        log=log,
-                    )
-                except Exception as e:
-                    log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
-                        f"you'll need to fill it manually.")
-                    result = None
+                    try:
+                        result = await autofill_form_multistep(
+                            company_page,
+                            profile,
+                            profile["resume_path"],
+                            profile.get("cover_letter_path"),
+                            max_steps=max_steps,
+                            screenshot_dir=SCREENSHOT_DIR,
+                            screenshot_prefix=f"job_{job_id}",
+                            # The interactive prompts below block until someone is
+                            # actually there to answer them -- notify the moment the
+                            # AI hands off, not only after all of them are answered.
+                            on_needs_review=lambda items: notify(
+                                f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
+                                f"come back to the terminal."
+                            ),
+                            ask_fn=ask_fn,
+                            on_frame=on_frame,
+                            log=log,
+                        )
+                    except Exception as e:
+                        log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
+                            f"you'll need to fill it manually.")
+                        result = None
 
-                # autofill_form_multistep may have added new profile['custom_answers']
-                # entries from what you typed in during this listing -- persist those.
-                save_profile(profile)
+                    # autofill_form_multistep may have added new profile['custom_answers']
+                    # entries from what you typed in during this listing -- persist those.
+                    save_profile(profile)
 
-                # Notify as soon as the AI's autofill attempt is done, one way or
-                # another -- success, needs review, or failed -- not just when the
-                # application ends up fully ready to submit. You might be away from
-                # the browser and want to know it's done either way.
-                if result is None:
-                    notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
-                           f"you'll need to fill it manually.")
-                elif result.needs_review or result.errors:
-                    application_tracking.record(
-                        job_id, "needs_review", company_page.url, result.needs_review, result.errors
-                    )
-                    log(f"[{i + 1}/{num_listings}] Needs review: "
-                        f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
-                    for item in result.needs_review:
-                        log(f"    - {item['label']}: {item['reasoning']}")
-                    for item in result.errors:
-                        log(f"    ! {item['label']}: {item['error']}")
-                    notify(f"[{i + 1}/{num_listings}] Filled, but {len(result.needs_review)} "
-                           f"field(s) need your review before you submit.")
-                else:
-                    application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
-                    log(f"[{i + 1}/{num_listings}] All fields filled confidently.")
-                    notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
+                    # Notify as soon as the AI's autofill attempt is done, one way or
+                    # another -- success, needs review, or failed -- not just when the
+                    # application ends up fully ready to submit. You might be away from
+                    # the browser and want to know it's done either way.
+                    if result is None:
+                        notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
+                               f"you'll need to fill it manually.")
+                    elif result.needs_review or result.errors:
+                        application_tracking.record(
+                            job_id, "needs_review", company_page.url, result.needs_review, result.errors
+                        )
+                        log(f"[{i + 1}/{num_listings}] Needs review: "
+                            f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
+                        for item in result.needs_review:
+                            log(f"    - {item['label']}: {item['reasoning']}")
+                        for item in result.errors:
+                            log(f"    ! {item['label']}: {item['error']}")
+                        notify(f"[{i + 1}/{num_listings}] Filled, but {len(result.needs_review)} "
+                               f"field(s) need your review before you submit.")
+                    else:
+                        application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
+                        log(f"[{i + 1}/{num_listings}] All fields filled confidently.")
+                        notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
 
-            if on_frame is not None and company_page is not None:
-                frame_bytes = await take_frame_screenshot(company_page)
-                if frame_bytes is not None:
-                    on_frame(frame_bytes)
-            confirm(f"[{i + 1}/{num_listings}] Review the form in the browser "
+                if on_frame is not None and company_page is not None:
+                    frame_bytes = await take_frame_screenshot(company_page)
+                    if frame_bytes is not None:
+                        on_frame(frame_bytes)
+
+                action = confirm(
+                    f"[{i + 1}/{num_listings}] Review the form in the browser "
                     f"(check anything flagged above), then submit manually if it looks right. "
-                    f"Press Enter to continue...")
+                    f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
+                    f"retry autofill on this same page instead of moving on. Press Enter to "
+                    f"continue, or type 'retry' and press Enter to retry autofill...",
+                    retryable=company_page is not None,
+                )
+                if company_page is None or (action or "").strip().lower() != "retry":
+                    break
+                log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
 
             # jobright shows a "Did you apply?" popup when you switch back to this tab
             # after visiting the company page -- that's your call to answer, not the

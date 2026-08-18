@@ -122,6 +122,7 @@
       </div>
       <div id="confirm-banner">
         <div id="confirm-text"></div>
+        <button id="retry-btn" class="btn-secondary" style="display:none;">Retry Autofill</button>
         <button id="confirm-btn" class="btn-primary">Continue</button>
       </div>
     </div>
@@ -156,6 +157,7 @@ const confirmBtn = document.getElementById("confirm-btn");
 const reviewPanel = document.getElementById("review-panel");
 const reviewLabel = document.getElementById("review-label");
 const reviewReason = document.getElementById("review-reason");
+const retryBtn = document.getElementById("retry-btn");
 const reviewOptions = document.getElementById("review-options");
 const reviewSubmit = document.getElementById("review-submit");
 const reviewSkip = document.getElementById("review-skip");
@@ -186,8 +188,9 @@ function showFrame(base64Data) {
   viewPlaceholder.style.display = "none";
 }
 
-function showConfirm(prompt) {
+function showConfirm(prompt, retryable) {
   confirmText.textContent = prompt;
+  retryBtn.style.display = retryable ? "inline-block" : "none";
   confirmBanner.classList.add("visible");
 }
 
@@ -291,7 +294,7 @@ function connect() {
         setRunningUI(!!msg.running);
         setStatus(msg.running ? "running" : null, msg.running ? "running" : "idle");
         if (msg.pending) {
-          if (msg.pending.kind === "confirm") showConfirm(msg.pending.prompt);
+          if (msg.pending.kind === "confirm") showConfirm(msg.pending.prompt, msg.pending.retryable);
           else if (msg.pending.kind === "ask") showAsk(msg.pending.item);
         }
         break;
@@ -304,7 +307,7 @@ function connect() {
       case "confirm":
         setRunningUI(true);
         setStatus("running", "waiting for you");
-        showConfirm(msg.prompt);
+        showConfirm(msg.prompt, msg.retryable);
         break;
       case "ask":
         setRunningUI(true);
@@ -362,7 +365,12 @@ resetBtn.addEventListener("click", async () => {
 
 confirmBtn.addEventListener("click", () => {
   hideConfirm();
-  ws.send(JSON.stringify({ type: "confirm_response" }));
+  ws.send(JSON.stringify({ type: "confirm_response", action: "continue" }));
+});
+
+retryBtn.addEventListener("click", () => {
+  hideConfirm();
+  ws.send(JSON.stringify({ type: "confirm_response", action: "retry" }));
 });
 
 reviewSubmit.addEventListener("click", () => {
