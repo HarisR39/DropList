@@ -241,11 +241,12 @@ async def run_automation(
                         notify(f"[{i + 1}/{num_listings}] A login window opened -- log in "
                                f"yourself to continue.")
                     elif result is not None and result.login_required:
-                        log(f"[{i + 1}/{num_listings}] This page looks like it wants you to "
-                            f"log into an existing account -- log in yourself in the browser, "
-                            f"then retry autofill.")
-                        notify(f"[{i + 1}/{num_listings}] Looks like a login is needed -- "
-                               f"log in yourself to continue.")
+                        log(f"[{i + 1}/{num_listings}] This page looks like it wants you to log "
+                            f"into an existing account, or only offers a third-party option like "
+                            f"\"Apply with LinkedIn/GitHub\" -- handle that yourself in the "
+                            f"browser, then retry autofill.")
+                        notify(f"[{i + 1}/{num_listings}] Looks like a login or third-party "
+                               f"apply option is needed -- handle it yourself to continue.")
                     elif result is None:
                         notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
                                f"you'll need to fill it manually.")
@@ -274,10 +275,11 @@ async def run_automation(
                 needs_login = login_popup is not None or (result is not None and result.login_required)
                 if needs_login:
                     action = confirm(
-                        f"[{i + 1}/{num_listings}] It looks like this page wants you to log "
-                        f"in. Log in yourself in the browser, then type 'retry' and press "
-                        f"Enter to have the AI retry autofill, or just press Enter to move on "
-                        f"without retrying.",
+                        f"[{i + 1}/{num_listings}] It looks like this page wants you to log in, "
+                        f"or only offers a third-party apply option (LinkedIn/GitHub/etc.) this "
+                        f"automation won't use. Handle that yourself in the browser, then type "
+                        f"'retry' and press Enter to have the AI retry autofill, or just press "
+                        f"Enter to move on without retrying.",
                         retryable=True,
                     )
                 else:

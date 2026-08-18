@@ -63,6 +63,22 @@ ENTRY_BUTTON_NAMES = ["Apply Now", "Apply for this Job", "Apply for this positio
 # it still excludes a bare "Apply" pill and "Quick Apply with MyGreenhouse".
 GENERIC_APPLY_BUTTON_PATTERN = re.compile(r"^apply\b.+", re.IGNORECASE)
 
+# "Apply with LinkedIn"/"Apply with GitHub"/etc. matches GENERIC_APPLY_BUTTON_
+# PATTERN just as readily as "Apply for Software Engineer" does -- these are
+# OAuth-style shortcuts this automation can't and shouldn't complete on your
+# behalf (it would mean logging into your LinkedIn/GitHub/etc. account), so
+# they're always skipped in favor of the site's own manual application path,
+# even when one would otherwise match first in DOM order.
+THIRD_PARTY_APPLY_KEYWORDS = [
+    "linkedin", "github", "indeed", "google", "facebook", "twitter",
+    "apple", "seek", "ziprecruiter", "monster", "glassdoor",
+]
+
+
+def _is_third_party_apply_option(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(keyword in lowered for keyword in THIRD_PARTY_APPLY_KEYWORDS)
+
 COOKIE_BANNER_SELECTORS = ["#onetrust-accept-btn-handler"]
 COOKIE_BANNER_BUTTON_NAMES = [
     "Accept All Cookies", "Accept All", "Accept Cookies", "I Accept", "Allow All", "Got it",
@@ -794,12 +810,19 @@ async def _get_mappings_with_timeout(
 
 
 async def find_button_by_names(page: Page, names: list[str]):
-    """Return a locator for the first button/link matching any of the given names, or None."""
+    """Return a locator for the first button/link matching any of the given
+    names, or None. Skips OAuth-style "Apply with <provider>" shortcuts
+    (LinkedIn, GitHub, Indeed, etc.) even if one would otherwise match
+    first in DOM order -- see _is_third_party_apply_option."""
     for name in names:
         for role in ("button", "link"):
             locator = page.get_by_role(role, name=name, exact=False)
-            if await locator.count() > 0:
-                return locator.first
+            count = await locator.count()
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                text = await candidate.inner_text()
+                if not _is_third_party_apply_option(text):
+                    return candidate
     return None
 
 
@@ -828,10 +851,17 @@ async def find_entry_button(page: Page, allow_bare_apply: bool = False):
     # "Apply" followed by more text -- this still excludes a bare "Apply" pill
     # (e.g. a scroll-to-form shortcut) and unrelated "Quick Apply ..." controls
     # that don't start with the word, both of which caused real problems before.
+    # Also skips "Apply with LinkedIn/GitHub/etc." (see _is_third_party_apply_option) --
+    # this pattern would otherwise match those just as readily as a real
+    # "Apply for <Job Title>" button.
     for role in ("button", "link"):
         locator = page.get_by_role(role, name=GENERIC_APPLY_BUTTON_PATTERN)
-        if await locator.count() > 0:
-            return locator.first
+        count = await locator.count()
+        for idx in range(count):
+            candidate = locator.nth(idx)
+            text = await candidate.inner_text()
+            if not _is_third_party_apply_option(text):
+                return candidate
 
     if allow_bare_apply:
         for role in ("button", "link"):
@@ -839,6 +869,32 @@ async def find_entry_button(page: Page, allow_bare_apply: bool = False):
             if await locator.count() > 0:
                 return locator.first
     return None
+
+
+async def _only_third_party_apply_available(page: Page) -> bool:
+    """True if the only apply-style buttons/links on the page are OAuth
+    shortcuts (Apply with LinkedIn/GitHub/etc.) with no manual/direct option
+    at all -- there's nothing safe for this automation to click in that
+    case, as opposed to find_entry_button returning None because the page
+    simply has no apply button yet (e.g. the real form is already showing)."""
+    found_any = False
+    for role in ("button", "link"):
+        for name in ENTRY_BUTTON_NAMES:
+            locator = page.get_by_role(role, name=name, exact=False)
+            count = await locator.count()
+            for idx in range(count):
+                found_any = True
+                text = await locator.nth(idx).inner_text()
+                if not _is_third_party_apply_option(text):
+                    return False
+        locator = page.get_by_role(role, name=GENERIC_APPLY_BUTTON_PATTERN)
+        count = await locator.count()
+        for idx in range(count):
+            found_any = True
+            text = await locator.nth(idx).inner_text()
+            if not _is_third_party_apply_option(text):
+                return False
+    return found_any
 
 
 async def dismiss_cookie_banner(page: Page) -> bool:
@@ -1071,11 +1127,15 @@ async def autofill_form_multistep(
     sees why a batch failed instead of it only landing in the terminal.
 
     If a step's fields look like a login gate for an EXISTING account (see
-    _looks_like_login_gate), stops immediately without attempting to fill
-    anything on that step -- there's no password in the profile that could
-    possibly be right for an account this automation never registered --
-    and returns with login_required=True so the caller can pause for a
-    human instead of guessing."""
+    _looks_like_login_gate), or the only apply entry point on the page is a
+    third-party OAuth shortcut (Apply with LinkedIn/GitHub/etc., see
+    _only_third_party_apply_available) with no manual option, stops
+    immediately without attempting anything on that step -- there's no
+    password in the profile that could possibly be right for an account
+    this automation never registered, and it should never complete a
+    third-party login on your behalf -- and returns with
+    login_required=True so the caller can pause for a human instead of
+    guessing."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -1114,6 +1174,8 @@ async def autofill_form_multistep(
             continue
 
         if not fields:
+            if await _only_third_party_apply_available(page):
+                login_required = True
             break
 
         await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)

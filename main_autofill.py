@@ -17,6 +17,7 @@ class FakeLocator:
         self.count = AsyncMock(return_value=count)
         self.is_visible = AsyncMock(return_value=visible)
         self.all_inner_texts = AsyncMock(return_value=[])
+        self.inner_text = AsyncMock(return_value="")
 
         async def _wait_for(*args, **kwargs):
             if count == 0:
@@ -62,8 +63,10 @@ class FakePage:
             self._role_locators[key] = FakeLocator()
         return self._role_locators[key]
 
-    def set_role_button(self, role: str, name: str | None = None, count: int = 1) -> FakeLocator:
+    def set_role_button(self, role: str, name: str | None = None, count: int = 1, text: str | None = None) -> FakeLocator:
         locator = FakeLocator(count=count)
+        if text is not None:
+            locator.inner_text = AsyncMock(return_value=text)
         self._role_locators[(role, name)] = locator
         return locator
 
@@ -979,6 +982,66 @@ async def test_find_entry_button_does_not_match_quick_apply_shortcut():
     page = FakePage()
     page.set_role_button("button", "Quick Apply with MyGreenhouse")
     assert await autofill.find_entry_button(page) is None
+
+
+def test_is_third_party_apply_option_matches_known_providers():
+    assert autofill._is_third_party_apply_option("Apply with LinkedIn")
+    assert autofill._is_third_party_apply_option("Continue with GitHub")
+    assert autofill._is_third_party_apply_option("Sign in with Indeed")
+    assert not autofill._is_third_party_apply_option("Apply for Software Engineer")
+    assert not autofill._is_third_party_apply_option("Apply Now")
+
+
+async def test_find_entry_button_skips_third_party_apply_option():
+    # "Apply Now" matches the exact-name list, but its real text says "with
+    # LinkedIn" -- an OAuth shortcut this automation can't and shouldn't
+    # complete on your behalf, so it must be skipped even though the name matched.
+    page = FakePage()
+    page.set_role_button("button", "Apply Now", text="Apply Now with LinkedIn")
+    assert await autofill.find_entry_button(page) is None
+
+
+async def test_find_entry_button_prefers_manual_over_third_party_option():
+    page = FakePage()
+    page.set_role_button("button", "Apply Now", text="Apply Now with GitHub")
+    page.set_role_button("button", autofill.GENERIC_APPLY_BUTTON_PATTERN, text="Apply for Software Engineer")
+
+    result = await autofill.find_entry_button(page)
+
+    assert result is not None
+    assert await result.inner_text() == "Apply for Software Engineer"
+
+
+async def test_only_third_party_apply_available_true_when_nothing_else_present():
+    page = FakePage()
+    page.set_role_button("button", "Apply Now", text="Apply Now with LinkedIn")
+    assert await autofill._only_third_party_apply_available(page) is True
+
+
+async def test_only_third_party_apply_available_false_when_manual_option_exists():
+    page = FakePage()
+    page.set_role_button("button", "Apply Now", text="Apply Now with LinkedIn")
+    page.set_role_button("button", autofill.GENERIC_APPLY_BUTTON_PATTERN, text="Apply for Software Engineer")
+    assert await autofill._only_third_party_apply_available(page) is False
+
+
+async def test_only_third_party_apply_available_false_when_nothing_present():
+    page = FakePage()
+    assert await autofill._only_third_party_apply_available(page) is False
+
+
+async def test_multistep_flags_login_required_when_only_third_party_apply_available(monkeypatch):
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=[]))
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(autofill, "_only_third_party_apply_available", AsyncMock(return_value=True))
+    autofill_form_mock = AsyncMock()
+    monkeypatch.setattr(autofill, "autofill_form", autofill_form_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    autofill_form_mock.assert_not_awaited()
+    assert result.login_required is True
 
 
 async def test_resolve_needs_review_interactively_fills_and_remembers_answer(monkeypatch):
