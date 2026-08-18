@@ -139,6 +139,7 @@ class AutofillResult:
     filled: list[str]
     needs_review: list[dict[str, Any]]
     errors: list[dict[str, Any]]
+    login_required: bool = False
 
 
 async def extract_fields(page: Page) -> list[FormField]:
@@ -644,6 +645,37 @@ async def apply_mapping(
     return AutofillResult(filled=filled, needs_review=needs_review, errors=errors)
 
 
+LOGIN_GATE_MAX_FIELDS = 4
+LOGIN_GATE_PHRASES = [
+    "welcome back", "already have an account", "forgot your password",
+    "forgot password", "sign in to your account", "log in to your account",
+]
+
+
+async def _looks_like_login_gate(page: Page, fields: list[FormField]) -> bool:
+    """Best-effort signal that this page is asking you to log into an
+    EXISTING account, rather than showing the real application form or a
+    normal new-account signup step. There's no reliable site-agnostic way
+    to tell these apart with certainty, so this only fires on a strong
+    pairing of two signals: a small password-bearing form (a real
+    application legitimately has a password field too sometimes, for new
+    account creation, but always alongside plenty of other real fields --
+    name, resume, etc.) AND clear "returning user" phrasing nearby (plain
+    account-creation forms don't say "welcome back" or "forgot your
+    password"). Without the phrasing, this falls back to the existing
+    account-signup handling (_account_signup_mappings) instead of stopping.
+    A false positive here just means pausing for a human a bit early,
+    never a wrong auto-fill or auto-submit."""
+    if not fields or len(fields) > LOGIN_GATE_MAX_FIELDS:
+        return False
+    if not any(f.type == "password" for f in fields):
+        return False
+    for phrase in LOGIN_GATE_PHRASES:
+        if await page.get_by_text(phrase, exact=False).count() > 0:
+            return True
+    return False
+
+
 def _account_signup_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
     """Deterministically map password fields (and any email field alongside them) to
     profile['account_password'] / profile['account_email']. A password can't be inferred
@@ -1036,10 +1068,18 @@ async def autofill_form_multistep(
 
     log, if given, replaces plain print() for mapping progress/failure
     messages, so a GUI backed by a log() callback (e.g. webapp.py) actually
-    sees why a batch failed instead of it only landing in the terminal."""
+    sees why a batch failed instead of it only landing in the terminal.
+
+    If a step's fields look like a login gate for an EXISTING account (see
+    _looks_like_login_gate), stops immediately without attempting to fill
+    anything on that step -- there's no password in the profile that could
+    possibly be right for an account this automation never registered --
+    and returns with login_required=True so the caller can pause for a
+    human instead of guessing."""
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
+    login_required = False
 
     await dismiss_cookie_banner(page)
 
@@ -1053,6 +1093,10 @@ async def autofill_form_multistep(
         # means clicking a bare "Apply" risks hitting an unrelated shortcut
         # instead of just filling what's already there (see find_entry_button).
         fields = await extract_fields(page)
+
+        if await _looks_like_login_gate(page, fields):
+            login_required = True
+            break
 
         entry_button = await find_entry_button(page, allow_bare_apply=not fields)
         if entry_button is not None:
@@ -1098,7 +1142,9 @@ async def autofill_form_multistep(
             break
         await _settle(page)
 
-    return AutofillResult(filled=all_filled, needs_review=all_needs_review, errors=all_errors)
+    return AutofillResult(
+        filled=all_filled, needs_review=all_needs_review, errors=all_errors, login_required=login_required
+    )
 
 
 async def _settle(page: Page) -> None:

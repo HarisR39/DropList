@@ -25,6 +25,17 @@ def save_profile(profile: dict) -> None:
         json.dump(profile, f, indent=2)
 
 
+def _find_login_popup(jobright_page, company_page):
+    """A same-context page other than the two we expect (jobright's own tab
+    and the company application tab) -- e.g. an OAuth "Continue with
+    Google/LinkedIn" flow opening its own window. Best-effort: there's no
+    reliable way to positively identify a login popup by URL/title across
+    arbitrary providers, so any unexpected extra page is treated as one."""
+    known = {jobright_page, company_page}
+    extras = [p for p in company_page.context.pages if p not in known]
+    return extras[0] if extras else None
+
+
 def notify(message: str) -> None:
     """Push a phone notification via ntfy.sh (https://ntfy.sh/<topic>) if
     NTFY_TOPIC is set. Best-effort -- a failed notification shouldn't crash
@@ -78,7 +89,16 @@ async def run_automation(
 
     on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
     right before each confirm() pause, in addition to the checkpoints already
-    covered inside autofill_form_multistep -- e.g. to drive a live view."""
+    covered inside autofill_form_multistep -- e.g. to drive a live view.
+
+    If a company page looks like it wants you to log into an existing
+    account -- either autofill_form_multistep detects a login gate on the
+    page itself (see its docstring / autofill._looks_like_login_gate), or a
+    separate popup window opens (e.g. an OAuth "Continue with Google/
+    LinkedIn" flow) -- autofill is skipped for that attempt and the review
+    pause explains what's going on instead of presenting it as an ordinary
+    review. Log in yourself, then choose Retry to have the AI take another
+    pass, or Continue to move on without retrying."""
     confirm = confirm_fn or (lambda prompt, retryable=False: input(prompt))
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
@@ -160,6 +180,9 @@ async def run_automation(
             # autofill pass on this same page rather than moving on. Runs
             # exactly once (no retry offered) if there's no company page.
             while True:
+                result = None
+                login_popup = None
+
                 if company_page is not None:
                     # let redirects/dynamic content settle before reading the form.
                     # Some career sites never go fully network-idle (analytics
@@ -171,40 +194,59 @@ async def run_automation(
                         pass
                     await company_page.wait_for_timeout(1500)
 
-                    try:
-                        result = await autofill_form_multistep(
-                            company_page,
-                            profile,
-                            profile["resume_path"],
-                            profile.get("cover_letter_path"),
-                            max_steps=max_steps,
-                            screenshot_dir=SCREENSHOT_DIR,
-                            screenshot_prefix=f"job_{job_id}",
-                            # The interactive prompts below block until someone is
-                            # actually there to answer them -- notify the moment the
-                            # AI hands off, not only after all of them are answered.
-                            on_needs_review=lambda items: notify(
-                                f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
-                                f"come back to the terminal."
-                            ),
-                            ask_fn=ask_fn,
-                            on_frame=on_frame,
-                            log=log,
-                        )
-                    except Exception as e:
-                        log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
-                            f"you'll need to fill it manually.")
-                        result = None
+                    login_popup = _find_login_popup(page, company_page)
 
-                    # autofill_form_multistep may have added new profile['custom_answers']
-                    # entries from what you typed in during this listing -- persist those.
-                    save_profile(profile)
+                    if login_popup is None:
+                        try:
+                            result = await autofill_form_multistep(
+                                company_page,
+                                profile,
+                                profile["resume_path"],
+                                profile.get("cover_letter_path"),
+                                max_steps=max_steps,
+                                screenshot_dir=SCREENSHOT_DIR,
+                                screenshot_prefix=f"job_{job_id}",
+                                # The interactive prompts below block until someone is
+                                # actually there to answer them -- notify the moment the
+                                # AI hands off, not only after all of them are answered.
+                                on_needs_review=lambda items: notify(
+                                    f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
+                                    f"come back to the terminal."
+                                ),
+                                ask_fn=ask_fn,
+                                on_frame=on_frame,
+                                log=log,
+                            )
+                        except Exception as e:
+                            log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
+                                f"you'll need to fill it manually.")
+                            result = None
+
+                        # autofill_form_multistep may have added new profile['custom_answers']
+                        # entries from what you typed in during this listing -- persist those.
+                        save_profile(profile)
+
+                        # A login popup can also appear as a side effect of the fill
+                        # attempt itself (e.g. clicking a "Continue with Google" button
+                        # partway through a multi-step form) -- check again now.
+                        login_popup = _find_login_popup(page, company_page)
 
                     # Notify as soon as the AI's autofill attempt is done, one way or
-                    # another -- success, needs review, or failed -- not just when the
-                    # application ends up fully ready to submit. You might be away from
-                    # the browser and want to know it's done either way.
-                    if result is None:
+                    # another -- success, needs review, failed, or blocked on login --
+                    # not just when the application ends up fully ready to submit. You
+                    # might be away from the browser and want to know it's done either way.
+                    if login_popup is not None:
+                        log(f"[{i + 1}/{num_listings}] A login window opened -- log in "
+                            f"yourself, then close it and retry autofill.")
+                        notify(f"[{i + 1}/{num_listings}] A login window opened -- log in "
+                               f"yourself to continue.")
+                    elif result is not None and result.login_required:
+                        log(f"[{i + 1}/{num_listings}] This page looks like it wants you to "
+                            f"log into an existing account -- log in yourself in the browser, "
+                            f"then retry autofill.")
+                        notify(f"[{i + 1}/{num_listings}] Looks like a login is needed -- "
+                               f"log in yourself to continue.")
+                    elif result is None:
                         notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
                                f"you'll need to fill it manually.")
                     elif result.needs_review or result.errors:
@@ -229,14 +271,24 @@ async def run_automation(
                     if frame_bytes is not None:
                         on_frame(frame_bytes)
 
-                action = confirm(
-                    f"[{i + 1}/{num_listings}] Review the form in the browser "
-                    f"(check anything flagged above), then submit manually if it looks right. "
-                    f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
-                    f"retry autofill on this same page instead of moving on. Press Enter to "
-                    f"continue, or type 'retry' and press Enter to retry autofill...",
-                    retryable=company_page is not None,
-                )
+                needs_login = login_popup is not None or (result is not None and result.login_required)
+                if needs_login:
+                    action = confirm(
+                        f"[{i + 1}/{num_listings}] It looks like this page wants you to log "
+                        f"in. Log in yourself in the browser, then type 'retry' and press "
+                        f"Enter to have the AI retry autofill, or just press Enter to move on "
+                        f"without retrying.",
+                        retryable=True,
+                    )
+                else:
+                    action = confirm(
+                        f"[{i + 1}/{num_listings}] Review the form in the browser "
+                        f"(check anything flagged above), then submit manually if it looks right. "
+                        f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
+                        f"retry autofill on this same page instead of moving on. Press Enter to "
+                        f"continue, or type 'retry' and press Enter to retry autofill...",
+                        retryable=company_page is not None,
+                    )
                 if company_page is None or (action or "").strip().lower() != "retry":
                     break
                 log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")

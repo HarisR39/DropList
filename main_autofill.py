@@ -44,6 +44,7 @@ class FakePage:
         self.url = url
         self._selector_locators: dict[str, FakeLocator] = {}
         self._role_locators: dict[tuple[str, str], FakeLocator] = {}
+        self._text_locators: dict[str, FakeLocator] = {}
         self.screenshot = AsyncMock()
         self.wait_for_load_state = AsyncMock()
         self.wait_for_timeout = AsyncMock()
@@ -64,6 +65,19 @@ class FakePage:
     def set_role_button(self, role: str, name: str | None = None, count: int = 1) -> FakeLocator:
         locator = FakeLocator(count=count)
         self._role_locators[(role, name)] = locator
+        return locator
+
+    def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
+        # Real Playwright's get_by_text(exact=False) is case-insensitive --
+        # normalize here so tests don't have to match casing exactly either.
+        key = text.strip().lower()
+        if key not in self._text_locators:
+            self._text_locators[key] = FakeLocator()
+        return self._text_locators[key]
+
+    def set_text(self, text: str, count: int = 1) -> FakeLocator:
+        locator = FakeLocator(count=count)
+        self._text_locators[text.strip().lower()] = locator
         return locator
 
 
@@ -740,6 +754,71 @@ async def test_multistep_on_needs_review_not_called_when_nothing_needs_review(mo
     )
 
     callback.assert_not_called()
+
+
+async def test_looks_like_login_gate_true_for_small_password_form_with_returning_user_phrase():
+    page = FakePage()
+    page.set_text("Welcome back", count=1)
+    fields = [
+        FormField("f0", "Email", "email", '[data-autofill-id="f0"]'),
+        FormField("f1", "Password", "password", '[data-autofill-id="f1"]'),
+    ]
+
+    assert await autofill._looks_like_login_gate(page, fields) is True
+
+
+async def test_looks_like_login_gate_false_without_returning_user_phrase():
+    # A password field alone (e.g. plain new-account creation) isn't enough --
+    # this should fall back to the existing account-signup handling instead
+    # of stopping the whole run.
+    page = FakePage()  # no matching text registered
+    fields = [
+        FormField("f0", "Password", "password", '[data-autofill-id="f0"]'),
+        FormField("f1", "Confirm Password", "password", '[data-autofill-id="f1"]'),
+        FormField("f2", "Email", "email", '[data-autofill-id="f2"]'),
+    ]
+
+    assert await autofill._looks_like_login_gate(page, fields) is False
+
+
+async def test_looks_like_login_gate_false_without_a_password_field():
+    page = FakePage()
+    page.set_text("Welcome back", count=1)
+    fields = [FormField("f0", "Email", "email", '[data-autofill-id="f0"]')]
+
+    assert await autofill._looks_like_login_gate(page, fields) is False
+
+
+async def test_looks_like_login_gate_false_for_large_forms_even_with_phrase_and_password():
+    # A real application form can legitimately have a password field (new
+    # account creation) alongside many other real fields -- a large field
+    # count means this is the actual application, not a bare login gate.
+    page = FakePage()
+    page.set_text("Welcome back", count=1)
+    fields = [
+        FormField(f"f{i}", f"Field {i}", "text", f"sel{i}") for i in range(4)
+    ] + [FormField("fp", "Password", "password", "selp")]
+
+    assert await autofill._looks_like_login_gate(page, fields) is False
+
+
+async def test_multistep_stops_and_flags_login_required_when_login_gate_detected(monkeypatch):
+    login_fields = [
+        FormField("f0", "Email", "email", '[data-autofill-id="f0"]'),
+        FormField("f1", "Password", "password", '[data-autofill-id="f1"]'),
+    ]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=login_fields))
+    monkeypatch.setattr(autofill, "_looks_like_login_gate", AsyncMock(return_value=True))
+    autofill_form_mock = AsyncMock()
+    monkeypatch.setattr(autofill, "autofill_form", autofill_form_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    autofill_form_mock.assert_not_awaited()
+    assert result.login_required is True
+    assert result.filled == []
+    assert result.needs_review == []
 
 
 async def test_multistep_form_caps_at_max_steps(monkeypatch):
