@@ -100,8 +100,8 @@ async def test_single_step_form_fills_confident_fields(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": "from profile"},
             {"field_id": "f1", "value": "USA", "needs_review": False, "reasoning": "from profile"},
         ],
@@ -126,8 +126,8 @@ async def test_select_value_not_in_options_becomes_needs_review(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "USA", "needs_review": False, "reasoning": "candidate is US based"},
         ],
     )
@@ -148,8 +148,8 @@ async def test_select_value_matches_option_case_insensitively(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "united states  ", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -172,8 +172,8 @@ async def test_radio_group_exact_match(monkeypatch):
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": "They/Them", "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "They/Them", "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -192,8 +192,8 @@ async def test_radio_group_word_overlap_fallback_match(monkeypatch):
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": "Not a veteran", "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Not a veteran", "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -210,8 +210,8 @@ async def test_radio_group_no_match_becomes_needs_review(monkeypatch):
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": "Unknown", "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Unknown", "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -230,8 +230,8 @@ async def test_radio_group_falls_back_to_other_option_when_unmatched(monkeypatch
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": "Curricular Practical Training", "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Curricular Practical Training", "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -247,8 +247,8 @@ async def test_select_falls_back_to_other_option_when_unmatched(monkeypatch):
                          options=["Computer Science", "Mathematics", "Not Listed"])]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": "Philosophy", "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Philosophy", "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -267,8 +267,8 @@ async def test_checkbox_group_falls_back_to_other_when_unmatched(monkeypatch):
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": ["A friend told me"], "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": ["A friend told me"], "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -294,8 +294,8 @@ async def test_checkbox_group_checks_matching_options(monkeypatch):
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        autofill, "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": ["LinkedIn", "Notion Blog"], "needs_review": False, "reasoning": ""},
         ],
     )
@@ -316,8 +316,8 @@ async def test_checkbox_group_empty_list_means_none_apply_not_review(monkeypatch
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": [], "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": [], "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -335,8 +335,8 @@ async def test_checkbox_group_unmatched_values_becomes_needs_review(monkeypatch)
     )]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
-        autofill, "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [{"field_id": "f0", "value": ["Nonexistent"], "needs_review": False, "reasoning": ""}],
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": ["Nonexistent"], "needs_review": False, "reasoning": ""}],
     )
 
     page = FakePage()
@@ -398,8 +398,8 @@ async def test_combobox_field_matched_from_already_open_options(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "United States", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -425,8 +425,8 @@ async def test_combobox_falls_back_to_typing_when_nothing_open_initially(monkeyp
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Odessa, FL", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -456,8 +456,8 @@ async def test_combobox_no_matching_option_becomes_needs_review(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Atlantis", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -480,8 +480,8 @@ async def test_combobox_falls_back_to_sole_unnamed_option(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Odessa, FL", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -503,8 +503,8 @@ async def test_combobox_does_not_guess_among_ambiguous_options(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Odessa", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -529,8 +529,8 @@ async def test_combobox_fuzzy_matches_paraphrased_option_among_several_open(monk
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": "Not a veteran", "needs_review": False, "reasoning": ""},
         ],
     )
@@ -556,8 +556,8 @@ async def test_needs_review_field_is_skipped_not_guessed(monkeypatch):
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     monkeypatch.setattr(
         autofill,
-        "get_mappings_cached",
-        lambda fields, profile, domain, log=print: [
+        "get_mappings",
+        lambda fields, profile: [
             {"field_id": "f0", "value": None, "needs_review": True, "reasoning": "no info in profile"},
         ],
     )
@@ -1253,7 +1253,7 @@ async def test_custom_answer_reused_without_calling_claude(monkeypatch):
     def _boom(*args, **kwargs):
         raise AssertionError("Claude should not be called when a custom answer is cached")
 
-    monkeypatch.setattr(autofill, "get_mappings_cached", _boom)
+    monkeypatch.setattr(autofill, "get_mappings", _boom)
 
     fields = [FormField("f0", "Essay Question", "textarea", '[data-autofill-id="f0"]')]
     profile = {**PROFILE, "custom_answers": {"essay question": "My answer from before"}}
@@ -1270,7 +1270,7 @@ async def test_account_signup_fields_filled_deterministically_without_claude(mon
     def _boom(*args, **kwargs):
         raise AssertionError("Claude should not be called for password/account-email fields")
 
-    monkeypatch.setattr(autofill, "get_mappings_cached", _boom)
+    monkeypatch.setattr(autofill, "get_mappings", _boom)
 
     fields = [
         FormField("f0", "Password", "password", '[data-autofill-id="f0"]'),
@@ -1321,10 +1321,12 @@ def test_mapping_cache_round_trip():
     assert mapping_cache.get("example.com", "somehash") == mappings
 
 
-def test_get_mappings_cached_splits_large_field_lists_into_batches(monkeypatch):
+async def test_map_and_apply_in_batches_splits_large_field_lists_and_fills_each_batch(monkeypatch):
     # Large forms overwhelm local models' instruction-following (seen live: an
     # 87-field Lever form producing valid JSON missing the "mappings" key
-    # entirely) -- each call should only ever see MAPPING_BATCH_SIZE fields.
+    # entirely) -- each call should only ever see MAPPING_BATCH_SIZE fields,
+    # and each batch's fields get filled right after that batch is mapped
+    # (not held back until every batch is mapped).
     monkeypatch.setattr(autofill, "MAPPING_BATCH_SIZE", 3)
     fields = [FormField(f"f{i}", f"Field {i}", "text", f"sel{i}") for i in range(7)]
     seen_batch_sizes = []
@@ -1335,15 +1337,20 @@ def test_get_mappings_cached_splits_large_field_lists_into_batches(monkeypatch):
 
     monkeypatch.setattr(autofill, "get_mappings", fake_get_mappings)
 
-    result = autofill.get_mappings_cached(fields, PROFILE, "example.com")
+    page = FakePage()
+    result = await autofill._map_and_apply_in_batches(
+        page, fields, PROFILE, "example.com", resume_path="resume.pdf", cover_letter_path=None
+    )
 
     assert seen_batch_sizes == [3, 3, 1]
-    assert [m["field_id"] for m in result] == [f"f{i}" for i in range(7)]
+    assert result.filled == [f"Field {i}" for i in range(7)]
+    for i in range(7):
+        page.locator(f"sel{i}").fill.assert_awaited_once_with(f"Field {i}")
 
 
-def test_get_mappings_cached_isolates_a_failing_batch(monkeypatch):
-    # One batch erroring (malformed JSON, timeout, etc.) shouldn't lose the
-    # mappings another batch already got right.
+async def test_map_and_apply_in_batches_isolates_a_failing_batch(monkeypatch):
+    # One batch erroring (malformed JSON, timeout, etc.) shouldn't lose --
+    # or unfill -- the fields another batch already mapped and filled.
     monkeypatch.setattr(autofill, "MAPPING_BATCH_SIZE", 2)
     fields = [FormField(f"f{i}", f"Field {i}", "text", f"sel{i}") for i in range(4)]
 
@@ -1354,13 +1361,49 @@ def test_get_mappings_cached_isolates_a_failing_batch(monkeypatch):
 
     monkeypatch.setattr(autofill, "get_mappings", fake_get_mappings)
 
-    result = autofill.get_mappings_cached(fields, PROFILE, "example.com")
-    by_id = {m["field_id"]: m for m in result}
+    page = FakePage()
+    result = await autofill._map_and_apply_in_batches(
+        page, fields, PROFILE, "example.com", resume_path="resume.pdf", cover_letter_path=None
+    )
 
-    assert by_id["f0"]["value"] == "ok"
-    assert by_id["f1"]["value"] == "ok"
-    assert by_id["f2"]["needs_review"] is True
-    assert by_id["f3"]["needs_review"] is True
+    assert result.filled == ["Field 0", "Field 1"]
+    page.locator("sel0").fill.assert_awaited_once_with("ok")
+    page.locator("sel1").fill.assert_awaited_once_with("ok")
+    page.locator("sel2").fill.assert_not_awaited()
+    page.locator("sel3").fill.assert_not_awaited()
+    needs_review_ids = {item["field_id"] for item in result.needs_review}
+    assert needs_review_ids == {"f2", "f3"}
+
+
+async def test_map_and_apply_in_batches_times_out_only_the_stuck_batch(monkeypatch):
+    # The actual scenario this whole design change was for: a slow/stuck
+    # batch should only cost its own fields, not fields already mapped and
+    # filled by an earlier, faster batch.
+    monkeypatch.setattr(autofill, "MAPPING_BATCH_SIZE", 1)
+    monkeypatch.setattr(autofill, "LLM_TIMEOUT_SECONDS", 0.05)
+    fields = [
+        FormField("f0", "Fast Field", "text", "sel0"),
+        FormField("f1", "Slow Field", "text", "sel1"),
+    ]
+
+    def fake_get_mappings(batch, profile):
+        if batch[0].field_id == "f1":
+            import time as time_module
+            time_module.sleep(0.3)
+        return [{"field_id": f.field_id, "value": "ok", "needs_review": False, "reasoning": ""} for f in batch]
+
+    monkeypatch.setattr(autofill, "get_mappings", fake_get_mappings)
+
+    page = FakePage()
+    result = await autofill._map_and_apply_in_batches(
+        page, fields, PROFILE, "example.com", resume_path="resume.pdf", cover_letter_path=None
+    )
+
+    assert result.filled == ["Fast Field"]
+    page.locator("sel0").fill.assert_awaited_once_with("ok")
+    page.locator("sel1").fill.assert_not_awaited()
+    assert len(result.needs_review) == 1
+    assert result.needs_review[0]["field_id"] == "f1"
 
 
 def test_get_mappings_handles_bare_list_response(monkeypatch):

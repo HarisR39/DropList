@@ -34,13 +34,15 @@ import mapping_cache
 LLM_PROVIDER = os.environ.get("AUTOFILL_LLM_PROVIDER", "ollama")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 ANTHROPIC_MODEL = "claude-sonnet-5"
+# Applies per batch (see MAPPING_BATCH_SIZE), not to the form as a whole --
+# fields are mapped and filled one batch at a time, so a slow/stuck batch
+# only costs its own fields, not the whole form's progress.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("AUTOFILL_LLM_TIMEOUT", "150"))
 # Local models lose track of the exact JSON schema and start dropping/misnaming
 # keys on very large forms (seen: 87 fields on a Lever form producing valid
 # JSON that was missing the "mappings" wrapper entirely). Batching keeps each
 # call small enough to be reliable.
 MAPPING_BATCH_SIZE = int(os.environ.get("AUTOFILL_MAPPING_BATCH_SIZE", "12"))
-PER_BATCH_TIMEOUT_SECONDS = 45
 
 _anthropic_client = None
 
@@ -409,48 +411,6 @@ def get_mappings(fields: list[FormField], profile: dict[str, Any]) -> list[dict[
     return parsed["mappings"]
 
 
-def get_mappings_cached(
-    fields: list[FormField], profile: dict[str, Any], domain: str, log: Any = print
-) -> list[dict[str, Any]]:
-    """Same as get_mappings, but (a) splits large field lists into smaller
-    batches -- local models start dropping/misnaming JSON keys on very large
-    forms (seen: an 87-field Lever form producing valid JSON missing the
-    "mappings" key entirely) -- and (b) caches (and can fail) per batch, so
-    one bad batch doesn't lose mappings the rest of the form already got
-    right, and a retry doesn't have to redo batches that already succeeded.
-
-    log(), if given, replaces plain print() for progress/failure messages --
-    see main.run_automation's docstring. Runs off the main thread (via
-    asyncio.to_thread), so log must be safe to call from a worker thread;
-    the queue.Queue-backed bridge in webapp.py already is."""
-    all_mappings: list[dict[str, Any]] = []
-    batches = [fields[i:i + MAPPING_BATCH_SIZE] for i in range(0, len(fields), MAPPING_BATCH_SIZE)]
-
-    for batch_num, batch in enumerate(batches, start=1):
-        field_hash = mapping_cache.hash_fields(batch)
-        cached = mapping_cache.get(domain, field_hash)
-        if cached is not None:
-            all_mappings.extend(cached)
-            continue
-
-        if len(batches) > 1:
-            log(f"  Batch {batch_num}/{len(batches)} ({len(batch)} field(s))...")
-        try:
-            batch_mappings = get_mappings(batch, profile)
-        except Exception as e:
-            log(f"  Batch {batch_num}/{len(batches)} failed ({e}); flagging its fields for manual review.")
-            batch_mappings = [
-                {"field_id": f.field_id, "value": None, "needs_review": True,
-                 "reasoning": f"LLM mapping call failed or returned malformed JSON for this batch ({e})"}
-                for f in batch
-            ]
-        else:
-            mapping_cache.store(domain, field_hash, batch_mappings)
-        all_mappings.extend(batch_mappings)
-
-    return all_mappings
-
-
 def _best_word_overlap_index(value: str, option_texts: list[str]) -> int | None:
     """Index of the option with the most word overlap with value, or None if
     there's no clear single winner. Used when Playwright's literal substring
@@ -769,44 +729,98 @@ async def autofill_form(
     account_mappings, account_handled_ids = _account_signup_mappings(fields, profile)
     custom_mappings, custom_handled_ids = _custom_answer_mappings(fields, profile)
     handled_ids = account_handled_ids | custom_handled_ids
+    handled_fields = [f for f in fields if f.field_id in handled_ids]
     remaining = [f for f in fields if f.field_id not in handled_ids]
 
-    mappings = account_mappings + custom_mappings
+    # Deterministic fields (account signup, remembered custom answers) need no
+    # LLM call, so fill those in right away rather than waiting on whatever
+    # comes next.
+    result = await apply_mapping(
+        page, handled_fields, account_mappings + custom_mappings, resume_path, cover_letter_path
+    )
+
     if remaining:
         domain = urlparse(page.url).netloc
-        mappings.extend(await _get_mappings_with_timeout(remaining, profile, domain, log))
-
-    return await apply_mapping(page, fields, mappings, resume_path, cover_letter_path)
-
-
-async def _get_mappings_with_timeout(
-    fields: list[FormField], profile: dict[str, Any], domain: str, log: Any = print
-) -> list[dict[str, Any]]:
-    """Run the (blocking) LLM mapping call off the event loop, log progress
-    so a slow local model doesn't look like a hang, and give up gracefully
-    (flagging for manual review) instead of blocking forever."""
-    num_batches = max(1, -(-len(fields) // MAPPING_BATCH_SIZE))  # ceil div
-    timeout = max(LLM_TIMEOUT_SECONDS, num_batches * PER_BATCH_TIMEOUT_SECONDS)
-    log(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
-        f"({num_batches} batch(es))...")
-    start = time.time()
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(get_mappings_cached, fields, profile, domain, log),
-            timeout=timeout,
+        batch_result = await _map_and_apply_in_batches(
+            page, remaining, profile, domain, resume_path, cover_letter_path, log
         )
-        log(f"  Got mappings in {time.time() - start:.1f}s.")
-        return result
-    except asyncio.TimeoutError:
-        log(f"  Timed out after {timeout}s waiting for {LLM_PROVIDER}; "
-            f"flagging these fields for manual review.")
-    except Exception as e:
-        log(f"  Mapping call failed ({e}); flagging these fields for manual review.")
+        result = AutofillResult(
+            filled=result.filled + batch_result.filled,
+            needs_review=result.needs_review + batch_result.needs_review,
+            errors=result.errors + batch_result.errors,
+        )
 
-    return [
-        {"field_id": f.field_id, "value": None, "needs_review": True, "reasoning": "LLM mapping call failed or timed out"}
-        for f in fields
-    ]
+    return result
+
+
+async def _map_and_apply_in_batches(
+    page: Page,
+    fields: list[FormField],
+    profile: dict[str, Any],
+    domain: str,
+    resume_path: str,
+    cover_letter_path: str | None,
+    log: Any = print,
+) -> AutofillResult:
+    """Map and fill one batch of fields at a time, instead of mapping the
+    whole form before filling anything. If a later batch's LLM call times out
+    or fails, everything already mapped and filled from earlier batches stays
+    filled -- only the batch that's actually stuck loses its own fields to
+    manual review, not the whole form's progress. Also means the form fills
+    in progressively (visible in a live view) rather than all at once at the
+    end. Caches (and can fail) per batch too, same as before, so a retry
+    doesn't have to redo batches that already succeeded.
+
+    log(), if given, replaces plain print() for progress/failure messages --
+    see main.run_automation's docstring."""
+    all_filled: list[str] = []
+    all_needs_review: list[dict[str, Any]] = []
+    all_errors: list[dict[str, Any]] = []
+
+    batches = [fields[i:i + MAPPING_BATCH_SIZE] for i in range(0, len(fields), MAPPING_BATCH_SIZE)]
+    num_batches = len(batches)
+    if num_batches > 1:
+        log(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
+            f"({num_batches} batch(es))...")
+
+    for batch_num, batch in enumerate(batches, start=1):
+        field_hash = mapping_cache.hash_fields(batch)
+        cached = mapping_cache.get(domain, field_hash)
+        if cached is not None:
+            batch_mappings = cached
+        else:
+            if num_batches > 1:
+                log(f"  Batch {batch_num}/{num_batches} ({len(batch)} field(s))...")
+            start = time.time()
+            try:
+                batch_mappings = await asyncio.wait_for(
+                    asyncio.to_thread(get_mappings, batch, profile),
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
+                log(f"  Batch {batch_num}/{num_batches} mapped in {time.time() - start:.1f}s.")
+                mapping_cache.store(domain, field_hash, batch_mappings)
+            except asyncio.TimeoutError:
+                log(f"  Batch {batch_num}/{num_batches} timed out after {LLM_TIMEOUT_SECONDS}s "
+                    f"waiting for {LLM_PROVIDER}; flagging its fields for manual review.")
+                batch_mappings = [
+                    {"field_id": f.field_id, "value": None, "needs_review": True,
+                     "reasoning": "LLM mapping call timed out for this batch"}
+                    for f in batch
+                ]
+            except Exception as e:
+                log(f"  Batch {batch_num}/{num_batches} failed ({e}); flagging its fields for manual review.")
+                batch_mappings = [
+                    {"field_id": f.field_id, "value": None, "needs_review": True,
+                     "reasoning": f"LLM mapping call failed or returned malformed JSON for this batch ({e})"}
+                    for f in batch
+                ]
+
+        batch_result = await apply_mapping(page, batch, batch_mappings, resume_path, cover_letter_path)
+        all_filled.extend(batch_result.filled)
+        all_needs_review.extend(batch_result.needs_review)
+        all_errors.extend(batch_result.errors)
+
+    return AutofillResult(filled=all_filled, needs_review=all_needs_review, errors=all_errors)
 
 
 async def find_button_by_names(page: Page, names: list[str]):
