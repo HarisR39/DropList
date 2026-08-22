@@ -157,6 +157,17 @@ async def run_automation(
             new_pages = [p2 for p2 in page.context.pages if p2 not in pages_before]
             if new_pages:
                 company_page = new_pages[0]
+                # A single apply-now click can occasionally open more than one
+                # new tab (e.g. an ad/tracking redirect alongside the real
+                # destination, more common on listings that route through a
+                # login/OAuth provider) -- close the extras immediately so they
+                # don't clutter the browser or get mistaken for a genuine login
+                # popup later (see _find_login_popup).
+                for extra in new_pages[1:]:
+                    try:
+                        await extra.close()
+                    except Exception:
+                        pass
             else:
                 apply_without_customizing = page.get_by_text("Apply without Customizing", exact=True)
                 if await apply_without_customizing.count() > 0:
@@ -166,6 +177,14 @@ async def run_automation(
                         company_page = await new_page_info.value
                     except Exception:
                         company_page = None
+
+                    if company_page is not None:
+                        for extra in page.context.pages:
+                            if extra not in pages_before and extra is not company_page:
+                                try:
+                                    await extra.close()
+                                except Exception:
+                                    pass
 
             if company_page is not None:
                 await company_page.wait_for_load_state()
