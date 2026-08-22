@@ -70,15 +70,18 @@ async def run_automation(
     view instead of (or alongside) the terminal.
 
     confirm_fn(prompt, retryable=False), if given, replaces the terminal
-    input() calls that just wait for acknowledgement (review-and-continue
-    pause; the "did you apply?" popup when ask_fn isn't given) -- called with
-    a message, expected to block until the user responds. retryable=True only
-    for the review-and-continue pause; a response of "retry" (case-
-    insensitive, whitespace-trimmed) there re-runs autofill on the same page
-    from scratch instead of moving on -- e.g. after manually dismissing a
-    popup that got in the AI's way. Any other response (including the
-    default terminal input()'s usual blank Enter) means continue. Defaults
-    to real input().
+    input() calls that just wait for acknowledgement -- called with a
+    message, expected to block until the user responds. retryable=True
+    (whenever there's a company page to retry on) at every one of these
+    pauses: the review-and-continue pause, and both "did you apply?"
+    fallback pauses (the terminal prompt, and the GUI's "couldn't match
+    your answer" fallback). A response of "retry" (case-insensitive,
+    whitespace-trimmed) at ANY of them loops back to a fresh
+    autofill_form_multistep pass on the same company page from scratch --
+    e.g. you dismissed a popup that got in the AI's way, or you just want
+    another attempt, not necessarily right after a failure or login gate.
+    Any other response (including the default terminal input()'s usual
+    blank Enter) means continue as before. Defaults to real input().
 
     ask_fn, if given, is passed through to autofill_form_multistep to replace
     the terminal prompt for fields the AI couldn't confidently answer -- see
@@ -193,11 +196,14 @@ async def run_automation(
                 log(f"[{i + 1}/{num_listings}] No resume-customize popup or new tab appeared; "
                     f"check the browser window.")
 
-            # Loops back only on an explicit "retry" response from the review
-            # pause below -- e.g. you noticed a popup got in the AI's way,
-            # dismissed it yourself in the browser, and want a fresh full
-            # autofill pass on this same page rather than moving on. Runs
-            # exactly once (no retry offered) if there's no company page.
+            # Loops back to a fresh autofill_form_multistep pass on the same
+            # company_page whenever ANY confirm() below gets an explicit
+            # "retry" response -- not just the review pause, but also the
+            # "did you apply?" fallback pauses further down. That's the point:
+            # you can trigger a fresh autofill attempt whenever you want, not
+            # only right after one has already failed or hit a login gate.
+            # Runs exactly once (no retry offered anywhere) if there's no
+            # company page.
             while True:
                 result = None
                 login_popup = None
@@ -310,15 +316,19 @@ async def run_automation(
                         f"continue, or type 'retry' and press Enter to retry autofill...",
                         retryable=company_page is not None,
                     )
-                if company_page is None or (action or "").strip().lower() != "retry":
-                    break
-                log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                if company_page is not None and (action or "").strip().lower() == "retry":
+                    log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                    continue
 
-            # jobright shows a "Did you apply?" popup when you switch back to this tab
-            # after visiting the company page -- that's your call to answer, not the
-            # script's, and leaving it open can block the next listing's clicks.
-            did_you_apply = page.get_by_text("Did you apply", exact=False)
-            if await did_you_apply.count() > 0:
+                # jobright shows a "Did you apply?" popup when you switch back to this tab
+                # after visiting the company page -- that's your call to answer, not the
+                # script's, and leaving it open can block the next listing's clicks. A
+                # "retry" response from either of its own fallback pauses below also
+                # loops back to the top instead of just re-prompting the same popup.
+                did_you_apply = page.get_by_text("Did you apply", exact=False)
+                if await did_you_apply.count() == 0:
+                    break
+
                 if on_frame is not None:
                     frame_bytes = await take_frame_screenshot(page)
                     if frame_bytes is not None:
@@ -339,11 +349,27 @@ async def run_automation(
                         await page.get_by_text(match, exact=True).first.click()
                         await page.wait_for_timeout(500)
                     else:
-                        confirm("Couldn't match your answer to a button -- click Yes or "
-                                "No yourself in the browser, then press Enter here to continue...")
+                        action = confirm(
+                            "Couldn't match your answer to a button -- click Yes or No "
+                            "yourself in the browser, then press Enter here to continue "
+                            "(or type 'retry' to retry autofill instead)...",
+                            retryable=company_page is not None,
+                        )
+                        if company_page is not None and (action or "").strip().lower() == "retry":
+                            log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                            continue
                 else:
-                    confirm("A \"Did you apply?\" popup is open in the browser -- click Yes or "
-                            "No yourself, then press Enter here to continue...")
+                    action = confirm(
+                        "A \"Did you apply?\" popup is open in the browser -- click Yes or "
+                        "No yourself, then press Enter here to continue (or type 'retry' "
+                        "to retry autofill instead)...",
+                        retryable=company_page is not None,
+                    )
+                    if company_page is not None and (action or "").strip().lower() == "retry":
+                        log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                        continue
+
+                break
 
             await page.go_back()
             await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
