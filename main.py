@@ -136,6 +136,17 @@ async def run_automation(
                 break
 
             if "/jobs/info/" not in page.url:
+                # jobright's navigation after clicking a listing isn't instant --
+                # checking page.url the moment you click Continue can catch it
+                # mid-navigation and wrongly report "not on a job page yet" even
+                # though you did click one. Give it a couple seconds to actually
+                # land before giving up.
+                try:
+                    await page.wait_for_url("**/jobs/info/**", timeout=3000)
+                except Exception:
+                    pass
+
+            if "/jobs/info/" not in page.url:
                 log(f"Doesn't look like you're on a job listing page yet (current "
                     f"URL: {page.url}) -- click into a listing, then continue again.")
                 continue
