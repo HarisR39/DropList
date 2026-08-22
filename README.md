@@ -4,8 +4,8 @@ A personal automation tool that logs into [jobright.ai](https://jobright.ai), wa
 
 ## What it actually does
 
-1. Signs into jobright.ai and opens its "Recommended" jobs feed.
-2. For a configurable number of listings, opens the job detail page, clicks through jobright's own apply flow, and lands on the real company application page (Greenhouse, Lever, Ashby, SmartRecruiters, Rippling, Gusto, and others) in a new tab. This step alone handles a pile of real-world inconsistency: a full-screen onboarding-tour overlay that can intercept clicks, a "did you apply?" popup that shows up when you switch back to the jobright tab, and an apply flow that sometimes shows a "customize your resume" modal first and sometimes opens the company tab directly with no modal at all.
+1. Signs into jobright.ai and opens its "Recommended" jobs feed, then pauses: browse the feed yourself and click into whichever listing you actually want to apply to (through to its job detail page), then continue — there's no fixed list of listings it works through on its own. Repeats this pause after each one, so you pick every listing one at a time for as long as you want; end the session with Stop (or Ctrl+C in the terminal) whenever you're done.
+2. Once you continue on a job detail page, clicks through jobright's own apply flow and lands on the real company application page (Greenhouse, Lever, Ashby, SmartRecruiters, Rippling, Gusto, and others) in a new tab. This step alone handles a pile of real-world inconsistency: a full-screen onboarding-tour overlay that can intercept clicks, a "did you apply?" popup that shows up when you switch back to the jobright tab, an apply flow that sometimes shows a "customize your resume" modal first and sometimes opens the company tab directly with no modal at all, and a single click that occasionally opens more than one new tab (closes the extras automatically).
 3. If the company page is just a landing page with no form yet, finds and clicks through the real "Apply"-style button — including ones with dynamic text like "Apply for Software Engineering Intern" that can't be matched by a fixed list, while still avoiding false positives like a "Quick Apply" shortcut or a bare "Apply" pill sitting next to a form that's already loaded.
 4. Extracts every field on the real form via the accessibility tree — including messy real-world cases most naive scrapers miss:
    - Native `<select>` dropdowns vs. custom JS-driven comboboxes (react-select-style widgets)
@@ -74,7 +74,7 @@ python main.py       # plain terminal script
 python webapp.py     # web GUI at http://127.0.0.1:8765/
 ```
 
-Adjust `NUM_LISTINGS_TO_REVIEW` and `MAX_FORM_STEPS` at the top of `main.py` to control how many listings to process per run and how many steps a multi-step form is allowed to take.
+Adjust `MAX_FORM_STEPS` at the top of `main.py` to control how many steps a multi-step form is allowed to take. There's no listing-count setting — you pick each listing yourself, one at a time, for as long as you want.
 
 ## Testing
 

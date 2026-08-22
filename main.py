@@ -9,7 +9,6 @@ from playwright.async_api import async_playwright
 import application_tracking
 from autofill import autofill_form_multistep, take_frame_screenshot
 
-NUM_LISTINGS_TO_REVIEW = 5
 MAX_FORM_STEPS = 6
 SCREENSHOT_DIR = "screenshots"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
@@ -59,12 +58,16 @@ async def run_automation(
     confirm_fn: Callable[[str], None] | None = None,
     ask_fn: Any = None,
     on_frame: Callable[[bytes], None] | None = None,
-    num_listings: int = NUM_LISTINGS_TO_REVIEW,
     max_steps: int = MAX_FORM_STEPS,
 ) -> None:
-    """Sign into jobright.ai and walk through its recommended listings,
-    autofilling each one's real application form. Never submits anything --
-    always pauses for a human to review and submit.
+    """Sign into jobright.ai, then pause and let a human pick which listing to
+    apply to next -- browse the recommended feed yourself and click into
+    whatever job you want (through to its job detail page), then continue
+    here and this takes over: click Apply, autofill the real application
+    form, and pause again for review. Repeats for as many listings as you
+    like; there's no fixed number processed automatically -- end the session
+    with Stop (or Ctrl+C in the terminal) whenever you're done. Never submits
+    anything -- always pauses for a human to review and submit.
 
     log() replaces plain print() so a GUI can route status text into its own
     view instead of (or alongside) the terminal.
@@ -119,14 +122,25 @@ async def run_automation(
         await page.wait_for_url("**/jobs/recommend**", timeout=15000)
         await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
 
-        for i in range(num_listings):
-            titles = await page.query_selector_all("h2.index_job-title__Riiip")
-            if i >= len(titles):
-                log(f"Only {len(titles)} listings loaded, stopping early.")
+        i = 0
+        while True:
+            answer = (confirm(
+                "Logged into jobright.ai. Browse the recommended listings yourself "
+                "and click into whichever one you'd like to apply to, through to "
+                "its job detail page, then press Enter here (or click Continue) "
+                "and this will take over from there -- click Apply, autofill the "
+                "form, and pause for your review. Type 'stop' and press Enter (or "
+                "use Stop) to end this session whenever you're done applying."
+            ) or "").strip().lower()
+            if answer == "stop":
                 break
 
-            await titles[i].click()
-            await page.wait_for_url("**/jobs/info/**", timeout=15000)
+            if "/jobs/info/" not in page.url:
+                log(f"Doesn't look like you're on a job listing page yet (current "
+                    f"URL: {page.url}) -- click into a listing, then continue again.")
+                continue
+
+            i += 1
             job_id = page.url.rsplit("/jobs/info/", 1)[-1].split("?")[0]
 
             exit_button = page.get_by_text("EXIT", exact=True)
@@ -191,9 +205,9 @@ async def run_automation(
 
             if company_page is not None:
                 await company_page.wait_for_load_state()
-                log(f"[{i + 1}/{num_listings}] Company page opened: {company_page.url}")
+                log(f"[{i}] Company page opened: {company_page.url}")
             else:
-                log(f"[{i + 1}/{num_listings}] No resume-customize popup or new tab appeared; "
+                log(f"[{i}] No resume-customize popup or new tab appeared; "
                     f"check the browser window.")
 
             # Loops back to a fresh autofill_form_multistep pass on the same
@@ -235,7 +249,7 @@ async def run_automation(
                                 # actually there to answer them -- notify the moment the
                                 # AI hands off, not only after all of them are answered.
                                 on_needs_review=lambda items: notify(
-                                    f"[{i + 1}/{num_listings}] {len(items)} field(s) need your input -- "
+                                    f"[{i}] {len(items)} field(s) need your input -- "
                                     f"come back to the terminal."
                                 ),
                                 ask_fn=ask_fn,
@@ -243,7 +257,7 @@ async def run_automation(
                                 log=log,
                             )
                         except Exception as e:
-                            log(f"[{i + 1}/{num_listings}] Autofill failed on this page ({e}); "
+                            log(f"[{i}] Autofill failed on this page ({e}); "
                                 f"you'll need to fill it manually.")
                             result = None
 
@@ -261,36 +275,36 @@ async def run_automation(
                     # not just when the application ends up fully ready to submit. You
                     # might be away from the browser and want to know it's done either way.
                     if login_popup is not None:
-                        log(f"[{i + 1}/{num_listings}] A login window opened -- log in "
+                        log(f"[{i}] A login window opened -- log in "
                             f"yourself, then close it and retry autofill.")
-                        notify(f"[{i + 1}/{num_listings}] A login window opened -- log in "
+                        notify(f"[{i}] A login window opened -- log in "
                                f"yourself to continue.")
                     elif result is not None and result.login_required:
-                        log(f"[{i + 1}/{num_listings}] This page looks like it wants you to log "
+                        log(f"[{i}] This page looks like it wants you to log "
                             f"into an existing account, or only offers a third-party option like "
                             f"\"Apply with LinkedIn/GitHub\" -- handle that yourself in the "
                             f"browser, then retry autofill.")
-                        notify(f"[{i + 1}/{num_listings}] Looks like a login or third-party "
+                        notify(f"[{i}] Looks like a login or third-party "
                                f"apply option is needed -- handle it yourself to continue.")
                     elif result is None:
-                        notify(f"[{i + 1}/{num_listings}] Autofill failed on this page -- "
+                        notify(f"[{i}] Autofill failed on this page -- "
                                f"you'll need to fill it manually.")
                     elif result.needs_review or result.errors:
                         application_tracking.record(
                             job_id, "needs_review", company_page.url, result.needs_review, result.errors
                         )
-                        log(f"[{i + 1}/{num_listings}] Needs review: "
+                        log(f"[{i}] Needs review: "
                             f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
                         for item in result.needs_review:
                             log(f"    - {item['label']}: {item['reasoning']}")
                         for item in result.errors:
                             log(f"    ! {item['label']}: {item['error']}")
-                        notify(f"[{i + 1}/{num_listings}] Filled, but {len(result.needs_review)} "
+                        notify(f"[{i}] Filled, but {len(result.needs_review)} "
                                f"field(s) need your review before you submit.")
                     else:
                         application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
-                        log(f"[{i + 1}/{num_listings}] All fields filled confidently.")
-                        notify(f"[{i + 1}/{num_listings}] Application filled and ready to review/submit.")
+                        log(f"[{i}] All fields filled confidently.")
+                        notify(f"[{i}] Application filled and ready to review/submit.")
 
                 if on_frame is not None and company_page is not None:
                     frame_bytes = await take_frame_screenshot(company_page)
@@ -300,7 +314,7 @@ async def run_automation(
                 needs_login = login_popup is not None or (result is not None and result.login_required)
                 if needs_login:
                     action = confirm(
-                        f"[{i + 1}/{num_listings}] It looks like this page wants you to log in, "
+                        f"[{i}] It looks like this page wants you to log in, "
                         f"or only offers a third-party apply option (LinkedIn/GitHub/etc.) this "
                         f"automation won't use. Handle that yourself in the browser, then type "
                         f"'retry' and press Enter to have the AI retry autofill, or just press "
@@ -309,7 +323,7 @@ async def run_automation(
                     )
                 else:
                     action = confirm(
-                        f"[{i + 1}/{num_listings}] Review the form in the browser "
+                        f"[{i}] Review the form in the browser "
                         f"(check anything flagged above), then submit manually if it looks right. "
                         f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
                         f"retry autofill on this same page instead of moving on. Press Enter to "
@@ -317,7 +331,7 @@ async def run_automation(
                         retryable=company_page is not None,
                     )
                 if company_page is not None and (action or "").strip().lower() == "retry":
-                    log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                    log(f"[{i}] Retrying autofill on the same page...")
                     continue
 
                 # jobright shows a "Did you apply?" popup when you switch back to this tab
@@ -356,7 +370,7 @@ async def run_automation(
                             retryable=company_page is not None,
                         )
                         if company_page is not None and (action or "").strip().lower() == "retry":
-                            log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                            log(f"[{i}] Retrying autofill on the same page...")
                             continue
                 else:
                     action = confirm(
@@ -366,7 +380,7 @@ async def run_automation(
                         retryable=company_page is not None,
                     )
                     if company_page is not None and (action or "").strip().lower() == "retry":
-                        log(f"[{i + 1}/{num_listings}] Retrying autofill on the same page...")
+                        log(f"[{i}] Retrying autofill on the same page...")
                         continue
 
                 break
