@@ -992,6 +992,16 @@ def test_is_third_party_apply_option_matches_known_providers():
     assert not autofill._is_third_party_apply_option("Apply Now")
 
 
+def test_is_third_party_apply_option_matches_resume_import_shortcut():
+    # Oracle Recruiting Cloud-style "Apply with Resume"/"Apply with CV"
+    # buttons auto-parse an uploaded resume into the whole application
+    # instead of leaving the real form fields in place -- skipped just like
+    # an OAuth shortcut, in favor of the manual field-by-field path (which
+    # still uploads the resume itself via the real file-upload field).
+    assert autofill._is_third_party_apply_option("Apply with Resume")
+    assert autofill._is_third_party_apply_option("Apply with CV")
+
+
 async def test_find_entry_button_skips_third_party_apply_option():
     # "Apply Now" matches the exact-name list, but its real text says "with
     # LinkedIn" -- an OAuth shortcut this automation can't and shouldn't

@@ -70,10 +70,19 @@ GENERIC_APPLY_BUTTON_PATTERN = re.compile(r"^apply\b.+", re.IGNORECASE)
 # OAuth-style shortcuts this automation can't and shouldn't complete on your
 # behalf (it would mean logging into your LinkedIn/GitHub/etc. account), so
 # they're always skipped in favor of the site's own manual application path,
-# even when one would otherwise match first in DOM order.
+# even when one would otherwise match first in DOM order. "Resume"/"CV" is
+# grouped in here too for a different reason: some ATS platforms (e.g.
+# Oracle Recruiting Cloud) offer an "Apply with Resume" shortcut that
+# auto-parses an uploaded resume into the whole application instead of
+# leaving the real form fields in place -- skipping it in favor of the
+# manual path means the resume still gets attached (via the real file-
+# upload field autofill_form already handles), but every other field goes
+# through this module's own field-by-field mapping instead of the ATS's own
+# unpredictable resume parser.
 THIRD_PARTY_APPLY_KEYWORDS = [
     "linkedin", "github", "indeed", "google", "facebook", "twitter",
     "apple", "seek", "ziprecruiter", "monster", "glassdoor",
+    "resume", "cv",
 ]
 
 
@@ -691,6 +700,38 @@ def _account_signup_mappings(fields: list[FormField], profile: dict[str, Any]) -
     return mappings, handled_ids
 
 
+BOILERPLATE_CONSENT_PATTERNS = [
+    "terms and conditions", "terms of service", "terms of use",
+    "privacy policy", "privacy notice", "privacy statement",
+    "code of conduct", "data protection policy",
+]
+
+
+def _is_boilerplate_consent_checkbox(label: str) -> bool:
+    lowered = label.strip().lower()
+    return any(pattern in lowered for pattern in BOILERPLATE_CONSENT_PATTERNS)
+
+
+def _consent_checkbox_mappings(fields: list[FormField]) -> tuple[list[dict[str, Any]], set[str]]:
+    """Deterministically check boilerplate agree-to-terms/privacy-policy
+    checkboxes -- unlike an EEO/eligibility checkbox, agreeing to the site's
+    terms carries no factual claim about the candidate, so there's nothing
+    for a human to actually decide here. Handled directly instead of risking
+    an LLM refusal or a needs_review pause on every single application."""
+    mappings = []
+    handled_ids = set()
+    for f in fields:
+        if f.type == "checkbox" and _is_boilerplate_consent_checkbox(f.label):
+            mappings.append({
+                "field_id": f.field_id,
+                "value": "Yes",
+                "needs_review": False,
+                "reasoning": "boilerplate terms/privacy-policy consent required to proceed",
+            })
+            handled_ids.add(f.field_id)
+    return mappings, handled_ids
+
+
 def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
     """Reuse answers the user was previously asked for (profile['custom_answers'],
     keyed by lowercased field label) instead of asking again or re-flagging them."""
@@ -728,15 +769,16 @@ async def autofill_form(
 
     account_mappings, account_handled_ids = _account_signup_mappings(fields, profile)
     custom_mappings, custom_handled_ids = _custom_answer_mappings(fields, profile)
-    handled_ids = account_handled_ids | custom_handled_ids
+    consent_mappings, consent_handled_ids = _consent_checkbox_mappings(fields)
+    handled_ids = account_handled_ids | custom_handled_ids | consent_handled_ids
     handled_fields = [f for f in fields if f.field_id in handled_ids]
     remaining = [f for f in fields if f.field_id not in handled_ids]
 
-    # Deterministic fields (account signup, remembered custom answers) need no
-    # LLM call, so fill those in right away rather than waiting on whatever
-    # comes next.
+    # Deterministic fields (account signup, remembered custom answers,
+    # boilerplate consent checkboxes) need no LLM call, so fill those in
+    # right away rather than waiting on whatever comes next.
     result = await apply_mapping(
-        page, handled_fields, account_mappings + custom_mappings, resume_path, cover_letter_path
+        page, handled_fields, account_mappings + custom_mappings + consent_mappings, resume_path, cover_letter_path
     )
 
     if remaining:

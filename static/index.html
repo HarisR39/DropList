@@ -365,22 +365,26 @@ resetBtn.addEventListener("click", async () => {
 
 confirmBtn.addEventListener("click", () => {
   hideConfirm();
+  setStatus("running", "running");
   ws.send(JSON.stringify({ type: "confirm_response", action: "continue" }));
 });
 
 retryBtn.addEventListener("click", () => {
   hideConfirm();
+  setStatus("running", "running");
   ws.send(JSON.stringify({ type: "confirm_response", action: "retry" }));
 });
 
 reviewSubmit.addEventListener("click", () => {
   const answer = collectAskAnswer();
   hideAsk();
+  setStatus("running", "running");
   ws.send(JSON.stringify({ type: "ask_response", answer }));
 });
 
 reviewSkip.addEventListener("click", () => {
   hideAsk();
+  setStatus("running", "running");
   ws.send(JSON.stringify({ type: "ask_response", answer: "" }));
 });
 

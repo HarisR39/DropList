@@ -3,15 +3,30 @@ import json
 import os
 import urllib.request
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
 import application_tracking
-from autofill import autofill_form_multistep, take_frame_screenshot
+from autofill import AutofillResult, autofill_form_multistep, take_frame_screenshot
 
 MAX_FORM_STEPS = 6
 SCREENSHOT_DIR = "screenshots"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+
+# "Original Job Post" sometimes leads to the listing's original repost on a
+# job board rather than the company's own site (see run_automation's
+# docstring) -- these all require their own account/login to apply through
+# (Indeed's own "Apply now" doesn't mention "Indeed" in its own text once
+# you're already on indeed.com, so autofill.py's third-party-button text
+# filter can't catch it there). Checked by domain instead, before this
+# automation ever tries clicking anything on the page.
+JOB_BOARD_DOMAINS = ["indeed.com", "linkedin.com", "glassdoor.com", "ziprecruiter.com", "monster.com"]
+
+
+def _is_job_board_domain(url: str) -> bool:
+    netloc = urlparse(url).netloc.lower()
+    return any(netloc == domain or netloc.endswith("." + domain) for domain in JOB_BOARD_DOMAINS)
 
 
 def load_profile() -> dict:
@@ -111,6 +126,13 @@ async def run_automation(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=50)
         page = await browser.new_page()
+        # Pre-grant geolocation for every origin in this context so ATS sites
+        # (Oracle/Taleo, Workday, etc.) that ask for it on page load never
+        # trigger Chrome's native "wants to know your location" bubble --
+        # that bubble sits outside the page DOM and can physically cover the
+        # Apply button, making Playwright's click fail as if nothing were
+        # there to click.
+        await page.context.grant_permissions(["geolocation"])
         await page.goto("https://jobright.ai")
         await page.get_by_text("Sign In", exact=False).first.click()
         await page.fill("#basic_email", os.environ["JOBRIGHT_EMAIL"])
@@ -168,51 +190,36 @@ async def run_automation(
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(300)
 
-            # The "Customize Your Resume" modal (with the "Apply without
-            # Customizing" link) only shows up for listings with a low profile
-            # match score -- for others, this click opens the company tab
-            # directly with no modal at all. Watch for a new page across the
-            # whole apply-now click, not just the modal-click that may not happen.
+            # "Original Job Post" links out to the job's original source
+            # posting (the company's own careers page) in a new tab --
+            # unlike "Apply with Autofill", it never shows jobright's own
+            # "Customize Your Resume" modal.
             pages_before = set(page.context.pages)
-            await page.click("#apply-now-button-id", force=True)
+            company_page = None
+            try:
+                async with page.context.expect_page(timeout=15000) as new_page_info:
+                    await page.get_by_text("Original Job Post", exact=True).click()
+                company_page = await new_page_info.value
+            except Exception:
+                company_page = None
             await page.wait_for_timeout(800)
 
             exit_button = page.get_by_text("EXIT", exact=True)
             if await exit_button.count() > 0:
                 await exit_button.first.click()
 
-            company_page = None
-            new_pages = [p2 for p2 in page.context.pages if p2 not in pages_before]
-            if new_pages:
-                company_page = new_pages[0]
-                # A single apply-now click can occasionally open more than one
-                # new tab (e.g. an ad/tracking redirect alongside the real
-                # destination, more common on listings that route through a
-                # login/OAuth provider) -- close the extras immediately so they
-                # don't clutter the browser or get mistaken for a genuine login
+            if company_page is not None:
+                # A single click can occasionally open more than one new tab
+                # (e.g. an ad/tracking redirect alongside the real
+                # destination) -- close the extras immediately so they don't
+                # clutter the browser or get mistaken for a genuine login
                 # popup later (see _find_login_popup).
-                for extra in new_pages[1:]:
-                    try:
-                        await extra.close()
-                    except Exception:
-                        pass
-            else:
-                apply_without_customizing = page.get_by_text("Apply without Customizing", exact=True)
-                if await apply_without_customizing.count() > 0:
-                    try:
-                        async with page.context.expect_page(timeout=6000) as new_page_info:
-                            await apply_without_customizing.click(timeout=5000)
-                        company_page = await new_page_info.value
-                    except Exception:
-                        company_page = None
-
-                    if company_page is not None:
-                        for extra in page.context.pages:
-                            if extra not in pages_before and extra is not company_page:
-                                try:
-                                    await extra.close()
-                                except Exception:
-                                    pass
+                for extra in page.context.pages:
+                    if extra not in pages_before and extra is not company_page:
+                        try:
+                            await extra.close()
+                        except Exception:
+                            pass
 
             if company_page is not None:
                 await company_page.wait_for_load_state()
@@ -244,9 +251,22 @@ async def run_automation(
                         pass
                     await company_page.wait_for_timeout(1500)
 
-                    login_popup = _find_login_popup(page, company_page)
+                    if _is_job_board_domain(company_page.url):
+                        # This is a job board's own repost, not the company's
+                        # site -- its "Apply"/"Continue" buttons lead into
+                        # that board's own account signup/login (see
+                        # run_automation's docstring), so don't click
+                        # anything on it at all; treat it the same as any
+                        # other login-required page.
+                        log(f"[{i}] The original job post is hosted on "
+                            f"{urlparse(company_page.url).netloc}, not the company's own site -- "
+                            f"applying there needs an account with that site, so this automation "
+                            f"won't click anything here.")
+                        result = AutofillResult(filled=[], needs_review=[], errors=[], login_required=True)
+                    else:
+                        login_popup = _find_login_popup(page, company_page)
 
-                    if login_popup is None:
+                    if login_popup is None and result is None:
                         try:
                             result = await autofill_form_multistep(
                                 company_page,
