@@ -771,6 +771,36 @@ def _consent_checkbox_mappings(fields: list[FormField]) -> tuple[list[dict[str, 
     return mappings, handled_ids
 
 
+SECOND_ADDRESS_LABEL_PATTERNS = ["address line 2", "address 2", "address line two"]
+# \b word-boundary matches, not bare substrings -- "unit" as a plain
+# substring also matches inside "opportunity" ("opport-UNIT-y"), which
+# wrongly swallowed unrelated fields like "How did you hear about this
+# opportunity?" before this was word-boundary-anchored.
+SECOND_ADDRESS_LABEL_KEYWORD_PATTERN = re.compile(r"\b(apt|apartment|suite|unit)\b", re.IGNORECASE)
+
+
+def _is_second_address_field(label: str) -> bool:
+    lowered = label.strip().lower()
+    if any(pattern in lowered for pattern in SECOND_ADDRESS_LABEL_PATTERNS):
+        return True
+    # Covers "Apt/Suite/Unit", "Apartment, suite, etc.", "Unit #", and
+    # similar -- a job application has no other realistic reason to ask
+    # about an apartment/suite/unit, so a bare keyword match is safe here.
+    return SECOND_ADDRESS_LABEL_KEYWORD_PATTERN.search(lowered) is not None
+
+
+def _ignored_field_ids(fields: list[FormField]) -> set[str]:
+    """Field ids to skip entirely -- never filled, never flagged for manual
+    review, never even shown to the LLM. Currently just the near-universal
+    optional "Address Line 2"/"Apt/Suite/Unit" field: per explicit user
+    preference, this automation doesn't bother with a second address line at
+    all, and silently skipping it (rather than leaving it null+needs_review)
+    avoids cluttering every single application's review list with a field
+    that's essentially always optional and never actually needs a human
+    decision."""
+    return {f.field_id for f in fields if _is_second_address_field(f.label)}
+
+
 def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
     """Reuse answers the user was previously asked for (profile['custom_answers'],
     keyed by lowercased field label) instead of asking again or re-flagging them."""
@@ -803,6 +833,12 @@ async def autofill_form(
 ) -> AutofillResult:
     if fields is None:
         fields = await extract_fields(page)
+    if not fields:
+        return AutofillResult(filled=[], needs_review=[], errors=[])
+
+    ignored_ids = _ignored_field_ids(fields)
+    if ignored_ids:
+        fields = [f for f in fields if f.field_id not in ignored_ids]
     if not fields:
         return AutofillResult(filled=[], needs_review=[], errors=[])
 

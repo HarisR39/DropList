@@ -122,6 +122,60 @@ async def test_single_step_form_fills_confident_fields(monkeypatch):
     page.locator('[data-autofill-id="f1"]').select_option.assert_awaited_once_with(label="USA")
 
 
+def test_is_second_address_field_matches_common_phrasings():
+    assert autofill._is_second_address_field("Address Line 2")
+    assert autofill._is_second_address_field("Address 2")
+    assert autofill._is_second_address_field("Apt/Suite/Unit")
+    assert autofill._is_second_address_field("Apartment, suite, etc.")
+    assert autofill._is_second_address_field("Unit #")
+    assert not autofill._is_second_address_field("Address Line 1")
+    assert not autofill._is_second_address_field("City")
+    assert not autofill._is_second_address_field("First Name")
+    # Regression: "unit" is a bare substring of "opportunity" -- must be a
+    # real word match, not a naive `in` check.
+    assert not autofill._is_second_address_field("How did you hear about this opportunity?")
+    assert not autofill._is_second_address_field("Captain of a sports team? (optional)")
+
+
+async def test_autofill_form_skips_second_address_field_entirely(monkeypatch):
+    # Per explicit user preference: never fill it, never flag it for manual
+    # review either -- it should disappear from the result entirely, not
+    # show up as null+needs_review.
+    fields = [
+        FormField("f0", "First Name", "text", '[data-autofill-id="f0"]'),
+        FormField("f1", "Address Line 2", "text", '[data-autofill-id="f1"]'),
+    ]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock(
+        return_value=[{"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": "from profile"}]
+    )
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
+
+    assert result.filled == ["First Name"]
+    assert result.needs_review == []
+    assert result.errors == []
+    # The ignored field must never even reach the LLM -- only the real field
+    # should be in the batch sent to get_mappings.
+    mapped_fields = get_mappings_mock.call_args[0][0]
+    assert [f.field_id for f in mapped_fields] == ["f0"]
+
+
+async def test_autofill_form_returns_empty_result_when_only_second_address_field_present(monkeypatch):
+    fields = [FormField("f0", "Apt/Suite/Unit", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock()
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
+
+    assert result == AutofillResult(filled=[], needs_review=[], errors=[])
+    get_mappings_mock.assert_not_called()
+
+
 async def test_select_value_not_in_options_becomes_needs_review(monkeypatch):
     # A model can return a value that isn't verbatim one of the dropdown's
     # options (more common with smaller local models) -- that used to throw
