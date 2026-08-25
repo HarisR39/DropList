@@ -109,7 +109,7 @@
     <span><span id="status-dot" class="status-dot"></span><span id="status-text">idle</span></span>
     <div class="spacer"></div>
     <button id="start-btn" class="btn-primary">Start</button>
-    <button id="reset-btn" class="btn-secondary">Reset</button>
+    <button id="reset-btn" class="btn-secondary" disabled>Reset</button>
     <button id="stop-btn" class="btn-danger" disabled>Stop</button>
   </header>
 
@@ -180,6 +180,10 @@ function setStatus(kind, text) {
 function setRunningUI(running) {
   startBtn.disabled = running;
   stopBtn.disabled = !running;
+  // Soft reset only makes sense against a running automation -- there's no
+  // session to jump back to when nothing's running (see webapp.py's
+  // AutomationBridge.soft_reset).
+  resetBtn.disabled = !running;
 }
 
 function showFrame(base64Data) {
@@ -348,16 +352,15 @@ stopBtn.addEventListener("click", async () => {
 });
 
 resetBtn.addEventListener("click", async () => {
-  logEl.innerHTML = "";
-  viewImg.style.display = "none";
-  viewPlaceholder.style.display = "block";
+  // Soft reset keeps the same browser/login session going (see webapp.py's
+  // AutomationBridge.soft_reset) -- unlike the old hard reset, the log and
+  // live view stay put; run_automation's own "Resetting back to the
+  // internship listing page..." log line and the next confirm prompt are
+  // what actually show it happened.
   hideConfirm();
   hideAsk();
   const resp = await fetch("/reset", { method: "POST" });
-  if (resp.ok) {
-    setRunningUI(true);
-    setStatus("running", "restarting");
-  } else {
+  if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
     appendLog("Couldn't reset: " + (body.error || resp.statusText));
   }

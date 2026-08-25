@@ -57,6 +57,7 @@ class AutomationBridge:
         self._last_frame: str | None = None  # base64-encoded JPEG
         self._pending: dict | None = None  # {"kind": "confirm"|"ask", ...}
         self._pending_response: queue.Queue | None = None
+        self._soft_reset_requested = threading.Event()
 
     @property
     def is_running(self) -> bool:
@@ -82,6 +83,16 @@ class AutomationBridge:
     def _on_frame(self, frame_bytes: bytes) -> None:
         self.events.put(("frame", base64.b64encode(frame_bytes).decode("ascii")))
 
+    def _consume_soft_reset(self) -> bool:
+        """Passed to run_automation as should_reset -- checking here also
+        clears the flag, so a single soft_reset() request is consumed
+        exactly once instead of re-triggering on every future pause too.
+        Called from the worker thread; threading.Event is safe for that."""
+        if self._soft_reset_requested.is_set():
+            self._soft_reset_requested.clear()
+            return True
+        return False
+
     # ------------------------------------------------------- start / stop ---
 
     def start(self) -> bool:
@@ -91,6 +102,7 @@ class AutomationBridge:
         self._last_frame = None
         self._pending = None
         self._pending_response = None
+        self._soft_reset_requested.clear()
 
         def worker() -> None:
             loop = asyncio.new_event_loop()
@@ -102,6 +114,7 @@ class AutomationBridge:
                     self._run_automation_fn(
                         profile, log=self._log, confirm_fn=self._confirm_fn,
                         ask_fn=self._ask_fn, on_frame=self._on_frame,
+                        should_reset=self._consume_soft_reset,
                     )
                 )
                 self._task = task
@@ -133,20 +146,27 @@ class AutomationBridge:
         self._loop.call_soon_threadsafe(self._task.cancel)
         return True
 
-    async def reset(self) -> bool:
-        """Stop whatever's running (even mid-prompt, per stop() above) and
-        start a fresh run. Returns False if the previous run didn't actually
-        stop in time, so the caller doesn't end up with two automations
-        running (two Chromium instances) at once."""
-        if self.is_running:
-            self.stop()
-            for _ in range(150):  # ~15s
-                if not self.is_running:
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                return False
-        return self.start()
+    def soft_reset(self) -> bool:
+        """Ask the running automation to jump back to the internship
+        listing page and keep going on the SAME browser/login session,
+        instead of stop()+start()'s full teardown-and-relaunch (see
+        main.run_automation's should_reset/'reset' docs). Returns False if
+        nothing is running -- there's nothing to reset back to.
+
+        Takes effect immediately when a "confirm" prompt is currently
+        pending, by answering it with a "reset" sentinel run_automation
+        recognizes. An "ask" prompt (a per-field review question -- its
+        answer becomes literal form text, not a sentinel run_automation
+        would understand) or no pending prompt at all instead just flags
+        the request; it's picked up via should_reset() as soon as
+        run_automation reaches its next confirm() pause."""
+        if not self.is_running:
+            return False
+        if self._pending is not None and self._pending["kind"] == "confirm":
+            self.submit_response("confirm", "reset")
+        else:
+            self._soft_reset_requested.set()
+        return True
 
     # ------------------------------------------------------- broadcasting ---
     # Runs on the app's own event loop (started once via lifespan).
@@ -251,8 +271,8 @@ def create_app(run_automation_fn=run_automation) -> FastAPI:
 
     @app.post("/reset")
     async def reset_run():
-        if not await bridge.reset():
-            return JSONResponse({"error": "previous run didn't stop in time"}, status_code=500)
+        if not bridge.soft_reset():
+            return JSONResponse({"error": "not running"}, status_code=400)
         return {"status": "reset"}
 
     @app.websocket("/ws")

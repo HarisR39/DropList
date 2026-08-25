@@ -411,6 +411,10 @@ APPLY_VISION_PROMPT = (
     "button or link visible whose purpose is to start or begin a job "
     "application -- for example labeled something like \"Apply\", \"Apply Now\", "
     "\"Apply for this Job\", \"Start Application\", or similar? "
+    "Do NOT pick a button that imports/autofills the application from a "
+    "third-party account or a resume upload, such as \"Apply with LinkedIn\", "
+    "\"Apply with Indeed\", \"Apply with Google\", or \"Apply with Resume\"/\"CV\" -- "
+    "only a plain, direct apply button counts. "
     "If yes, reply with ONLY its exact visible text and nothing else. "
     "If there is no such button or link visible, reply with exactly: NONE"
 )
@@ -576,7 +580,8 @@ def _needs_review_entry(f: FormField, reasoning: str) -> dict[str, Any]:
 
 
 async def apply_mapping(
-    page: Page, fields: list[FormField], mappings: list[dict[str, Any]], resume_path: str, cover_letter_path: str | None
+    page: Page, fields: list[FormField], mappings: list[dict[str, Any]], resume_path: str, cover_letter_path: str | None,
+    on_frame: Any = None,
 ) -> AutofillResult:
     field_by_id = {f.field_id: f for f in fields}
     filled, needs_review, errors = [], [], []
@@ -663,6 +668,14 @@ async def apply_mapping(
             else:
                 await page.locator(f.selector).fill(str(value))
             filled.append(f.label)
+            if on_frame is not None:
+                # Capture right after this field's own visible change, not
+                # just before/after the whole batch -- so the live view
+                # tracks along as the form fills in field by field instead
+                # of jumping straight from empty to fully filled.
+                frame_bytes = await take_frame_screenshot(page)
+                if frame_bytes is not None:
+                    on_frame(frame_bytes)
         except Exception as e:
             errors.append({"label": f.label, "error": str(e)})
 
@@ -823,6 +836,88 @@ def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) ->
     return mappings, handled_ids
 
 
+# Plain contact/bio fields, matched by label -- straight lookups against
+# profile keys with no judgment involved (unlike EEO/eligibility Yes-No
+# questions, open-ended essays, or arbitrary dropdown option matching,
+# which all still need the LLM's actual language understanding and stay
+# out of this list on purpose -- see SYSTEM_PROMPT's own rules on those).
+# Order matters: first pattern to match wins, so more specific patterns
+# (e.g. "preferred name") are listed before more general ones they'd
+# otherwise be swallowed by.
+PROFILE_FIELD_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bpreferred\s*name\b|\bnickname\b|\bname\s+you\s+go\s+by\b|\bchosen\s*name\b", re.I), "preferred_name"),
+    (re.compile(r"\bfirst\s*name\b|\bgiven\s*name\b", re.I), "first_name"),
+    (re.compile(r"\blast\s*name\b|\bsurname\b|\bfamily\s*name\b", re.I), "last_name"),
+    (re.compile(r"\be[- ]?mail\b", re.I), "email"),
+    (re.compile(r"\bphone\b|\bmobile\b|\btelephone\b", re.I), "phone"),
+    (re.compile(r"\blinkedin\b", re.I), "linkedin_url"),
+    (re.compile(r"\bportfolio\b|\bpersonal\s*website\b|\bwebsite\b", re.I), "portfolio_url"),
+    (re.compile(r"\bschool\b|\buniversity\b|\bcollege\b", re.I), "school"),
+    (re.compile(r"\bdegree\b", re.I), "degree"),
+    (re.compile(r"\bfield\s*of\s*study\b|\bmajor\b", re.I), "field_of_study"),
+    (re.compile(r"\bcountry\b", re.I), "country"),
+]
+# "Phone Country Code" / "Dial Code" / "Area Code" ask for a short numeric
+# code, not the candidate's full phone number or country name -- must be
+# excluded up front, before "phone" or "country" above gets a chance to
+# match ("phone" comes first in the list and would otherwise win outright).
+_CODE_FIELD_EXCLUSION_PATTERN = re.compile(
+    r"\bcode\b.*\b(country|dial|area|phone)\b|\b(country|dial|area|phone)\b.*\bcode\b", re.I
+)
+# A label mentioning any of these isn't asking about the candidate at all
+# (an emergency contact, a professional reference, etc.) -- a bare "First
+# Name"/"Phone" match on one of those would wrongly fill someone else's
+# info with the candidate's own.
+PROFILE_FIELD_DISQUALIFYING_KEYWORDS = [
+    "reference", "emergency", "spouse", "supervisor", "manager", "employer",
+    "coworker", "colleague",
+]
+
+
+def _match_profile_field_key(label: str) -> str | None:
+    lowered = label.strip().lower()
+    if any(word in lowered for word in PROFILE_FIELD_DISQUALIFYING_KEYWORDS):
+        return None
+    if _CODE_FIELD_EXCLUSION_PATTERN.search(lowered):
+        return None
+    for pattern, key in PROFILE_FIELD_PATTERNS:
+        if pattern.search(lowered):
+            return key
+    return None
+
+
+def _profile_field_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+    """Deterministically fill plain single-value contact/bio fields (name,
+    email, phone, links, school, degree, field of study, country) straight
+    from the profile -- these need only a label match, not any actual
+    judgment, so there's no reason to spend an LLM call on them. Restricted
+    to simple text-ish input types on purpose: a select/combobox/radio
+    still needs real option matching, and a textarea's length usually
+    signals it wants more than a bare profile value dropped in verbatim."""
+    mappings = []
+    handled_ids = set()
+    for f in fields:
+        if f.type not in ("text", "email", "tel", "url"):
+            continue
+        key = _match_profile_field_key(f.label)
+        if key is None:
+            continue
+        value = profile.get(key)
+        if not value:
+            # Nothing confident to fill -- leave it in the batch so the LLM
+            # still gets a chance (e.g. it might derive a value this plain
+            # lookup can't), rather than silently giving up on it here.
+            continue
+        mappings.append({
+            "field_id": f.field_id,
+            "value": value,
+            "needs_review": False,
+            "reasoning": f"direct match from profile['{key}']",
+        })
+        handled_ids.add(f.field_id)
+    return mappings, handled_ids
+
+
 async def autofill_form(
     page: Page,
     profile: dict[str, Any],
@@ -830,6 +925,7 @@ async def autofill_form(
     cover_letter_path: str | None = None,
     fields: list[FormField] | None = None,
     log: Any = print,
+    on_frame: Any = None,
 ) -> AutofillResult:
     if fields is None:
         fields = await extract_fields(page)
@@ -845,21 +941,31 @@ async def autofill_form(
     account_mappings, account_handled_ids = _account_signup_mappings(fields, profile)
     custom_mappings, custom_handled_ids = _custom_answer_mappings(fields, profile)
     consent_mappings, consent_handled_ids = _consent_checkbox_mappings(fields)
-    handled_ids = account_handled_ids | custom_handled_ids | consent_handled_ids
+    already_handled_ids = account_handled_ids | custom_handled_ids | consent_handled_ids
+    # Only offered fields the earlier layers didn't already claim, so e.g. a
+    # remembered custom answer for "Email" still wins over the plain profile
+    # lookup instead of the two colliding on the same field.
+    profile_mappings, profile_handled_ids = _profile_field_mappings(
+        [f for f in fields if f.field_id not in already_handled_ids], profile
+    )
+    handled_ids = already_handled_ids | profile_handled_ids
     handled_fields = [f for f in fields if f.field_id in handled_ids]
     remaining = [f for f in fields if f.field_id not in handled_ids]
 
     # Deterministic fields (account signup, remembered custom answers,
-    # boilerplate consent checkboxes) need no LLM call, so fill those in
-    # right away rather than waiting on whatever comes next.
+    # boilerplate consent checkboxes, plain profile lookups) need no LLM
+    # call, so fill those in right away rather than waiting on whatever
+    # comes next.
     result = await apply_mapping(
-        page, handled_fields, account_mappings + custom_mappings + consent_mappings, resume_path, cover_letter_path
+        page, handled_fields,
+        account_mappings + custom_mappings + consent_mappings + profile_mappings,
+        resume_path, cover_letter_path, on_frame=on_frame,
     )
 
     if remaining:
         domain = urlparse(page.url).netloc
         batch_result = await _map_and_apply_in_batches(
-            page, remaining, profile, domain, resume_path, cover_letter_path, log
+            page, remaining, profile, domain, resume_path, cover_letter_path, log, on_frame=on_frame
         )
         result = AutofillResult(
             filled=result.filled + batch_result.filled,
@@ -878,6 +984,7 @@ async def _map_and_apply_in_batches(
     resume_path: str,
     cover_letter_path: str | None,
     log: Any = print,
+    on_frame: Any = None,
 ) -> AutofillResult:
     """Map and fill one batch of fields at a time, instead of mapping the
     whole form before filling anything. If a later batch's LLM call times out
@@ -932,7 +1039,7 @@ async def _map_and_apply_in_batches(
                     for f in batch
                 ]
 
-        batch_result = await apply_mapping(page, batch, batch_mappings, resume_path, cover_letter_path)
+        batch_result = await apply_mapping(page, batch, batch_mappings, resume_path, cover_letter_path, on_frame=on_frame)
         all_filled.extend(batch_result.filled)
         all_needs_review.extend(batch_result.needs_review)
         all_errors.extend(batch_result.errors)
@@ -1083,6 +1190,13 @@ async def _vision_find_apply_button_text(page: Page) -> str | None:
 
     answer = answer.strip().strip('"').strip("'")
     if not answer or answer.upper().startswith("NONE"):
+        return None
+    if _is_third_party_apply_option(answer):
+        # Defense in depth on top of the prompt's own instruction above --
+        # a local vision model isn't perfectly instruction-following, and a
+        # large, colorful "Apply with LinkedIn/Indeed/Resume" button is
+        # exactly the kind of thing it'll misidentify as *the* apply button,
+        # especially when the real form fields are smaller or out of frame.
         return None
     return answer
 
@@ -1336,17 +1450,24 @@ async def autofill_form_multistep(
         # many career sites keep a persistent header (search box, language
         # picker, etc.) that shows up as "fields" even on the pre-application
         # landing page, so we still need to check for an entry button even when
-        # fields are already present. But a bare "Apply" match is only safe to
-        # try when there are truly zero fields yet -- seeing any fields already
-        # means clicking a bare "Apply" risks hitting an unrelated shortcut
-        # instead of just filling what's already there (see find_entry_button).
+        # fields are already present. But a bare "Apply" match (and the vision
+        # fallback below) are only safe to try when there are truly zero REAL
+        # fields yet -- seeing any already means clicking a bare "Apply" risks
+        # hitting an unrelated shortcut instead of just filling what's already
+        # there (see find_entry_button). "Real" excludes fields extract_fields
+        # couldn't label at all ("(unlabeled)") -- almost always the same kind
+        # of page chrome noise, not anything actually answerable, and letting
+        # its mere presence block the entry-button/vision fallback wastes an
+        # LLM call mapping nothing useful and surfaces a blank, labelless
+        # review prompt instead of ever finding the real Apply button.
         fields = await extract_fields(page)
+        real_fields = [f for f in fields if f.label != "(unlabeled)"]
 
         if await _looks_like_login_gate(page, fields):
             login_required = True
             break
 
-        entry_button = await find_entry_button(page, allow_bare_apply=not fields)
+        entry_button = await find_entry_button(page, allow_bare_apply=not real_fields)
         if entry_button is not None:
             try:
                 await entry_button.click(timeout=5000)
@@ -1361,7 +1482,7 @@ async def autofill_form_multistep(
             await _settle(page)
             continue
 
-        if not fields:
+        if not real_fields:
             if await _only_third_party_apply_available(page):
                 login_required = True
                 break
@@ -1383,7 +1504,7 @@ async def autofill_form_multistep(
 
         await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
 
-        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields, log=log)
+        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields, log=log, on_frame=on_frame)
         remaining_needs_review = result.needs_review
         if remaining_needs_review and on_needs_review is not None:
             on_needs_review(remaining_needs_review)

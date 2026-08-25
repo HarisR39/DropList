@@ -82,7 +82,7 @@ def test_bridge_start_returns_false_when_already_running():
 # FastAPI TestClient: drives a fake run_automation_fn through /start, /ws, /stop.
 
 async def fake_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                           num_listings=5, max_steps=6):
+                           num_listings=5, max_steps=6, should_reset=None):
     log("starting")
     if on_frame:
         on_frame(b"fake-frame-bytes")
@@ -135,7 +135,7 @@ def test_start_twice_returns_409(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def slow_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                               num_listings=5, max_steps=6):
+                               num_listings=5, max_steps=6, should_reset=None):
         confirm_fn("blocking forever until stopped")
 
     app = webapp.create_app(run_automation_fn=slow_automation)
@@ -186,60 +186,79 @@ def test_reconnect_mid_pending_ask_replays_state(monkeypatch):
             assert msg == {"type": "finished", "text": "Run finished."}
 
 
-def test_reset_when_nothing_running_just_starts(monkeypatch):
-    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+def test_reset_when_nothing_running_returns_error():
+    # Soft reset only makes sense against a running automation -- same
+    # semantics as /stop, unlike the old hard-reset's start-if-idle fallback.
     app = webapp.create_app(run_automation_fn=fake_automation)
     with TestClient(app) as client:
-        with client.websocket_connect("/ws") as ws:
-            ws.receive_json()  # initial state
-
-            resp = client.post("/reset")
-            assert resp.status_code == 200
-
-            msg = ws.receive_json()
-            assert msg == {"type": "log", "text": "starting"}
+        resp = client.post("/reset")
+        assert resp.status_code == 400
 
 
-def test_reset_restarts_a_run_stuck_on_confirm(monkeypatch):
-    # Proves the stop()-unblocks-pending fix: without it, a run blocked on
-    # confirm_fn's response.get() can never actually be cancelled (the
-    # worker's event loop has no chance to process the scheduled
-    # cancellation), so reset() would time out and this would fail.
+def test_reset_answers_pending_confirm_with_reset_sentinel(monkeypatch):
+    # Soft reset must never tear down and relaunch the browser/session --
+    # unlike the old hard reset, this proves it's still the SAME run (no
+    # second "run starting" log, no "finished" event) that simply receives
+    # a "reset" answer to whatever confirm() it was blocked on.
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
-    calls = {"count": 0}
 
-    async def counting_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                   num_listings=5, max_steps=6):
-        calls["count"] += 1
-        n = calls["count"]
-        log(f"run {n} starting")
-        confirm_fn("blocking forever until reset")
-        await asyncio.sleep(10)  # would time the test out if not actually cancelled
-        log(f"run {n} finished")
+    async def confirm_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                  num_listings=5, max_steps=6, should_reset=None):
+        log("run starting")
+        action = confirm_fn("waiting for input")
+        log(f"got action: {action}")
 
-    app = webapp.create_app(run_automation_fn=counting_automation)
+    app = webapp.create_app(run_automation_fn=confirm_automation)
     with TestClient(app) as client:
         with client.websocket_connect("/ws") as ws:
             ws.receive_json()  # initial state
             client.post("/start")
 
             msg = ws.receive_json()
-            assert msg == {"type": "log", "text": "run 1 starting"}
+            assert msg == {"type": "log", "text": "run starting"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "blocking forever until reset", "retryable": False}
+            assert msg == {"type": "confirm", "prompt": "waiting for input", "retryable": False}
 
             resp = client.post("/reset")
             assert resp.status_code == 200
 
             msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "got action: reset"}
+            msg = ws.receive_json()
             assert msg["type"] == "finished"
 
-            msg = ws.receive_json()
-            assert msg == {"type": "log", "text": "run 2 starting"}
-            msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "blocking forever until reset", "retryable": False}
 
-            client.post("/stop")
+def test_reset_flags_soft_reset_when_nothing_pending(monkeypatch):
+    # When the worker thread isn't blocked on a confirm/ask at all (e.g.
+    # mid-autofill), soft reset can't answer anything directly -- it must
+    # instead be observable via should_reset() at whatever the automation's
+    # next safe checkpoint is.
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+
+    async def polling_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                  num_listings=5, max_steps=6, should_reset=None):
+        log("run starting")
+        for _ in range(100):
+            if should_reset():
+                log("reset flag observed")
+                return
+            await asyncio.sleep(0.02)
+        log("reset flag never observed")
+
+    app = webapp.create_app(run_automation_fn=polling_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+            client.post("/start")
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "run starting"}
+
+            resp = client.post("/reset")
+            assert resp.status_code == 200
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "reset flag observed"}
 
 
 def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
@@ -250,7 +269,7 @@ def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
     fill_count = {"n": 0}
 
     async def retry_loop_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                     num_listings=5, max_steps=6):
+                                     num_listings=5, max_steps=6, should_reset=None):
         while True:
             fill_count["n"] += 1
             log(f"filled attempt {fill_count['n']}")

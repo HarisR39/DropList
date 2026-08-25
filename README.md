@@ -67,6 +67,7 @@ Set the following environment variables (e.g. via `setx` on Windows, so they per
 | `OLLAMA_VISION_MODEL` | No | Vision model for the Apply-button fallback (default `moondream`) -- run `ollama pull moondream` first |
 | `AUTOFILL_VISION_TIMEOUT` | No | Seconds before a vision fallback check gives up (default 60) |
 | `OLLAMA_VULKAN` | No, but strongly recommended on AMD/Intel integrated GPUs | Set to `1` so Ollama itself (not this app) offloads inference to the iGPU via Vulkan instead of running on CPU alone -- roughly 2x faster in local testing, no quality tradeoff. Requires restarting the Ollama app/service after setting it. |
+| `LIVE_VIEW_INTERVAL_SECONDS` | No | How often (seconds) the live view refreshes on its own, independent of the action-triggered captures (default 1.5) |
 
 On Windows, `setx` only takes effect in terminals/processes started *after* it runs — restart your terminal (or fully quit and reopen VS Code, since its integrated terminal inherits the editor's own environment) before running the script.
 

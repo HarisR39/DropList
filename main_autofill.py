@@ -122,6 +122,43 @@ async def test_single_step_form_fills_confident_fields(monkeypatch):
     page.locator('[data-autofill-id="f1"]').select_option.assert_awaited_once_with(label="USA")
 
 
+async def test_apply_mapping_calls_on_frame_after_each_successful_fill():
+    # The live view should track along field by field as autofill actually
+    # changes the page, not just jump from empty to fully filled between
+    # the multistep loop's own before/after captures.
+    fields = [
+        FormField("f0", "First Name", "text", '[data-autofill-id="f0"]'),
+        FormField("f1", "Last Name", "text", '[data-autofill-id="f1"]'),
+    ]
+    mappings = [
+        {"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": ""},
+        {"field_id": "f1", "value": "Doe", "needs_review": False, "reasoning": ""},
+    ]
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"frame-bytes")
+    frames = []
+
+    result = await autofill.apply_mapping(page, fields, mappings, "resume.pdf", None, on_frame=frames.append)
+
+    assert result.filled == ["First Name", "Last Name"]
+    assert frames == [b"frame-bytes", b"frame-bytes"]
+
+
+async def test_apply_mapping_skips_on_frame_for_needs_review_field():
+    # No visible change happened for a field that was never actually
+    # filled -- only a real, successful fill should trigger a capture.
+    fields = [FormField("f0", "Mystery Field", "text", '[data-autofill-id="f0"]')]
+    mappings = [{"field_id": "f0", "value": None, "needs_review": True, "reasoning": "not in profile"}]
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"frame-bytes")
+    frames = []
+
+    result = await autofill.apply_mapping(page, fields, mappings, "resume.pdf", None, on_frame=frames.append)
+
+    assert len(result.needs_review) == 1
+    assert frames == []
+
+
 def test_is_second_address_field_matches_common_phrasings():
     assert autofill._is_second_address_field("Address Line 2")
     assert autofill._is_second_address_field("Address 2")
@@ -141,20 +178,25 @@ async def test_autofill_form_skips_second_address_field_entirely(monkeypatch):
     # Per explicit user preference: never fill it, never flag it for manual
     # review either -- it should disappear from the result entirely, not
     # show up as null+needs_review.
+    # "Favorite Color" (not "First Name") on purpose -- a plain profile-key
+    # match like First Name is now handled deterministically (see
+    # _profile_field_mappings) and would never reach get_mappings at all,
+    # which is exactly the point but would make this specific assertion
+    # (checking what DOES reach the LLM) moot.
     fields = [
-        FormField("f0", "First Name", "text", '[data-autofill-id="f0"]'),
+        FormField("f0", "Favorite Color", "text", '[data-autofill-id="f0"]'),
         FormField("f1", "Address Line 2", "text", '[data-autofill-id="f1"]'),
     ]
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
     get_mappings_mock = MagicMock(
-        return_value=[{"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": "from profile"}]
+        return_value=[{"field_id": "f0", "value": "Blue", "needs_review": False, "reasoning": "from profile"}]
     )
     monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
 
     page = FakePage()
     result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
 
-    assert result.filled == ["First Name"]
+    assert result.filled == ["Favorite Color"]
     assert result.needs_review == []
     assert result.errors == []
     # The ignored field must never even reach the LLM -- only the real field
@@ -174,6 +216,83 @@ async def test_autofill_form_returns_empty_result_when_only_second_address_field
 
     assert result == AutofillResult(filled=[], needs_review=[], errors=[])
     get_mappings_mock.assert_not_called()
+
+
+def test_match_profile_field_key_matches_common_contact_fields():
+    assert autofill._match_profile_field_key("First Name") == "first_name"
+    assert autofill._match_profile_field_key("Legal First Name") == "first_name"
+    assert autofill._match_profile_field_key("Last Name") == "last_name"
+    assert autofill._match_profile_field_key("Preferred Name") == "preferred_name"
+    assert autofill._match_profile_field_key("What should we call you?") is None
+    assert autofill._match_profile_field_key("Email") == "email"
+    assert autofill._match_profile_field_key("Email Address") == "email"
+    assert autofill._match_profile_field_key("Phone Number") == "phone"
+    assert autofill._match_profile_field_key("LinkedIn Profile") == "linkedin_url"
+    assert autofill._match_profile_field_key("Portfolio URL") == "portfolio_url"
+    assert autofill._match_profile_field_key("University") == "school"
+    assert autofill._match_profile_field_key("Degree") == "degree"
+    assert autofill._match_profile_field_key("Country") == "country"
+
+
+def test_match_profile_field_key_excludes_phone_country_code():
+    # "Phone Country Code" / "Dial Code" contain "country" as a bare
+    # substring but aren't asking for a country at all.
+    assert autofill._match_profile_field_key("Phone Country Code") is None
+    assert autofill._match_profile_field_key("Country Dial Code") is None
+
+
+def test_match_profile_field_key_excludes_third_party_context():
+    # A "First Name"-style field about someone OTHER than the candidate
+    # (an emergency contact, a reference) must not get the candidate's own
+    # info -- these fall through to the LLM, which reads the full label.
+    assert autofill._match_profile_field_key("Reference First Name") is None
+    assert autofill._match_profile_field_key("Emergency Contact Phone") is None
+    assert autofill._match_profile_field_key("Supervisor Email") is None
+
+
+def test_match_profile_field_key_returns_none_for_unmapped_labels():
+    assert autofill._match_profile_field_key("Favorite Color") is None
+    assert autofill._match_profile_field_key("Why do you want to work here?") is None
+
+
+async def test_autofill_form_fills_contact_fields_deterministically(monkeypatch):
+    # The point: get_mappings (the LLM call) is never invoked at all when
+    # every field is a plain profile-key match.
+    fields = [
+        FormField("f0", "First Name", "text", '[data-autofill-id="f0"]'),
+        FormField("f1", "Email Address", "email", '[data-autofill-id="f1"]'),
+    ]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock()
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
+
+    assert result.filled == ["First Name", "Email Address"]
+    assert result.needs_review == []
+    assert result.errors == []
+    get_mappings_mock.assert_not_called()
+    page.locator('[data-autofill-id="f0"]').fill.assert_awaited_once_with("Jane")
+    page.locator('[data-autofill-id="f1"]').fill.assert_awaited_once_with("jane@example.com")
+
+
+async def test_autofill_form_leaves_unmatched_profile_field_for_llm(monkeypatch):
+    # A profile-field-shaped label with no value actually in the profile
+    # (e.g. no linkedin_url set) shouldn't be silently skipped -- it should
+    # still reach the LLM, which might derive or ask about it instead.
+    fields = [FormField("f0", "LinkedIn Profile", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock(
+        return_value=[{"field_id": "f0", "value": None, "needs_review": True, "reasoning": "not in profile"}]
+    )
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
+
+    get_mappings_mock.assert_called_once()
+    assert len(result.needs_review) == 1
 
 
 async def test_select_value_not_in_options_becomes_needs_review(monkeypatch):
@@ -986,6 +1105,19 @@ async def test_vision_find_apply_button_text_returns_reported_text(monkeypatch):
     assert await autofill._vision_find_apply_button_text(page) == "Apply for this Job"
 
 
+async def test_vision_find_apply_button_text_rejects_third_party_shortcuts(monkeypatch):
+    # Regression: a local vision model isn't perfectly instruction-following
+    # and can misidentify a large "Apply with LinkedIn/Indeed/Resume" button
+    # as *the* apply button (see APPLY_VISION_PROMPT's own instruction not
+    # to) -- this must be filtered the same way find_entry_button already
+    # filters these from the DOM-based search, not just prompted against.
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+    for reported in ["Apply With LinkedIn", "Apply with Indeed", "Apply with Resume"]:
+        monkeypatch.setattr(autofill, "_call_ollama_vision", lambda *a, r=reported, **k: r)
+        assert await autofill._vision_find_apply_button_text(page) is None
+
+
 async def test_vision_find_apply_button_text_returns_none_on_model_error(monkeypatch):
     page = FakePage()
     page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
@@ -1109,6 +1241,32 @@ async def test_multistep_does_not_click_bare_apply_when_fields_already_present(m
 
     find_entry_button_mock.assert_awaited_once_with(page, allow_bare_apply=False)
     assert result.filled == ["Some Field"]
+
+
+async def test_multistep_treats_unlabeled_field_as_no_real_fields(monkeypatch):
+    # Regression: a page with only page-chrome noise (a header search box
+    # extract_fields couldn't label, hence "(unlabeled)") alongside a real
+    # Apply button the DOM search missed must still be treated as "no real
+    # fields yet" -- allowing the bare-Apply fallback and the vision
+    # fallback to run, instead of wastefully sending the unlabeled field to
+    # the LLM and surfacing a blank, labelless review prompt for it.
+    fields = [FormField("f0", "(unlabeled)", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    find_entry_button_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(autofill, "find_entry_button", find_entry_button_mock)
+    monkeypatch.setattr(autofill, "_vision_find_apply_button_text", AsyncMock(return_value="Apply for this job online"))
+    click_by_text_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(autofill, "_click_by_visible_text", click_by_text_mock)
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+    autofill_form_mock = AsyncMock()
+    monkeypatch.setattr(autofill, "autofill_form", autofill_form_mock)
+
+    page = FakePage()
+    await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=1)
+
+    find_entry_button_mock.assert_awaited_once_with(page, allow_bare_apply=True)
+    click_by_text_mock.assert_awaited_once_with(page, "Apply for this job online")
+    autofill_form_mock.assert_not_awaited()
 
 
 async def test_dismiss_cookie_banner_clicks_known_accept_button():
