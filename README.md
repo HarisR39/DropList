@@ -64,6 +64,9 @@ Set the following environment variables (e.g. via `setx` on Windows, so they per
 | `OLLAMA_MODEL` | No | Default `llama3.1:8b` |
 | `AUTOFILL_LLM_TIMEOUT` | No | Seconds before a mapping call gives up (default 150) |
 | `AUTOFILL_MAPPING_BATCH_SIZE` | No | Fields per LLM call (default 12) |
+| `OLLAMA_VISION_MODEL` | No | Vision model for the Apply-button fallback (default `moondream`) -- run `ollama pull moondream` first |
+| `AUTOFILL_VISION_TIMEOUT` | No | Seconds before a vision fallback check gives up (default 60) |
+| `OLLAMA_VULKAN` | No, but strongly recommended on AMD/Intel integrated GPUs | Set to `1` so Ollama itself (not this app) offloads inference to the iGPU via Vulkan instead of running on CPU alone -- roughly 2x faster in local testing, no quality tradeoff. Requires restarting the Ollama app/service after setting it. |
 
 On Windows, `setx` only takes effect in terminals/processes started *after* it runs — restart your terminal (or fully quit and reopen VS Code, since its integrated terminal inherits the editor's own environment) before running the script.
 

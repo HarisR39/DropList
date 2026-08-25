@@ -46,7 +46,12 @@ class FakePage:
         self._selector_locators: dict[str, FakeLocator] = {}
         self._role_locators: dict[tuple[str, str], FakeLocator] = {}
         self._text_locators: dict[str, FakeLocator] = {}
-        self.screenshot = AsyncMock()
+        # None (not an auto-vivified MagicMock, which is truthy) so any code
+        # under test that checks "if not screenshot" -- e.g.
+        # _vision_find_apply_button_text -- fails closed by default instead
+        # of falling through to a real, unmocked call. Tests that actually
+        # exercise screenshot behavior override this explicitly.
+        self.screenshot = AsyncMock(return_value=None)
         self.wait_for_load_state = AsyncMock()
         self.wait_for_timeout = AsyncMock()
         self.keyboard = MagicMock()
@@ -861,6 +866,9 @@ async def test_multistep_clicks_entry_button_then_fills_form(monkeypatch):
 
 
 async def test_multistep_gives_up_when_no_fields_and_no_entry_button(monkeypatch):
+    # The vision fallback (see _vision_find_apply_button_text) also tries on
+    # step 0 here, but FakePage's default screenshot() returns None, so it
+    # fails closed same as the DOM-based search -- genuinely nothing found.
     monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
     monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=[]))
     autofill_form_mock = AsyncMock()
@@ -870,7 +878,13 @@ async def test_multistep_gives_up_when_no_fields_and_no_entry_button(monkeypatch
     result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
 
     autofill_form_mock.assert_not_awaited()
-    assert result == AutofillResult(filled=[], needs_review=[], errors=[])
+    # An all-empty result would read as unqualified success to a caller --
+    # genuinely finding nothing to fill or click is flagged as an error
+    # instead, so it isn't mistaken for "form already complete."
+    assert result.filled == []
+    assert result.needs_review == []
+    assert len(result.errors) == 1
+    assert not result.login_required
 
 
 async def test_multistep_survives_entry_button_click_exception(monkeypatch):
@@ -889,7 +903,87 @@ async def test_multistep_survives_entry_button_click_exception(monkeypatch):
     result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
 
     autofill_form_mock.assert_not_awaited()
-    assert result == AutofillResult(filled=[], needs_review=[], errors=[])
+    # Same reasoning as above: giving up with nothing filled or clicked is
+    # flagged as an error, not reported as a clean, empty success.
+    assert result.filled == []
+    assert result.needs_review == []
+    assert len(result.errors) == 1
+    assert not result.login_required
+
+
+async def test_vision_find_apply_button_text_returns_none_without_screenshot():
+    # Default FakePage.screenshot() returns None -- the fallback must fail
+    # closed rather than call out to a (potentially unmocked) vision model.
+    page = FakePage()
+    assert await autofill._vision_find_apply_button_text(page) is None
+
+
+async def test_vision_find_apply_button_text_returns_none_when_model_says_none(monkeypatch):
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+    monkeypatch.setattr(autofill, "_call_ollama_vision", lambda *a, **k: "NONE")
+    assert await autofill._vision_find_apply_button_text(page) is None
+
+
+async def test_vision_find_apply_button_text_returns_reported_text(monkeypatch):
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+    monkeypatch.setattr(autofill, "_call_ollama_vision", lambda *a, **k: "Apply for this Job")
+    assert await autofill._vision_find_apply_button_text(page) == "Apply for this Job"
+
+
+async def test_vision_find_apply_button_text_returns_none_on_model_error(monkeypatch):
+    page = FakePage()
+    page.screenshot = AsyncMock(return_value=b"fake-jpeg-bytes")
+
+    def _raise(*a, **k):
+        raise Exception("ollama unreachable")
+
+    monkeypatch.setattr(autofill, "_call_ollama_vision", _raise)
+    assert await autofill._vision_find_apply_button_text(page) is None
+
+
+async def test_click_by_visible_text_clicks_matching_role_button():
+    page = FakePage()
+    button = page.set_role_button("button", "Apply for this Job", count=1)
+    assert await autofill._click_by_visible_text(page, "Apply for this Job") is True
+    button.click.assert_awaited_once()
+
+
+async def test_click_by_visible_text_falls_back_to_plain_text_match():
+    page = FakePage()
+    text_locator = page.set_text("Apply for this Job")
+    assert await autofill._click_by_visible_text(page, "Apply for this Job") is True
+    text_locator.click.assert_awaited_once()
+
+
+async def test_click_by_visible_text_returns_false_when_nothing_matches():
+    page = FakePage()
+    assert await autofill._click_by_visible_text(page, "Apply for this Job") is False
+
+
+async def test_multistep_uses_vision_fallback_when_entry_button_search_fails(monkeypatch):
+    # Regression: "Apply for this Job" visible on screen but not exposed via
+    # a normal accessible role/name Playwright can query (a styled <div>,
+    # custom web component, etc.) -- find_entry_button and extract_fields
+    # both come up empty, so the vision fallback is what actually finds and
+    # clicks it, instead of silently giving up with an all-empty result.
+    fields_calls = [[], [FormField("f0", "Name", "text", '[data-autofill-id="f0"]')]]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(side_effect=fields_calls))
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(autofill, "_vision_find_apply_button_text", AsyncMock(return_value="Apply for this Job"))
+    click_by_text_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(autofill, "_click_by_visible_text", click_by_text_mock)
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        autofill, "autofill_form", AsyncMock(return_value=AutofillResult(filled=["Name"], needs_review=[], errors=[]))
+    )
+
+    page = FakePage()
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    click_by_text_mock.assert_awaited_once_with(page, "Apply for this Job")
+    assert result.filled == ["Name"]
 
 
 async def test_find_entry_button_matches_apply_now_link():
@@ -1421,7 +1515,7 @@ def test_get_mappings_handles_bare_list_response(monkeypatch):
     # instruction-following strain and return the bare array instead.
     monkeypatch.setattr(
         autofill, "_call_ollama",
-        lambda user_content: '[{"field_id": "f0", "value": "Jane", "needs_review": false, "reasoning": ""}]',
+        lambda user_content, num_predict=4096: '[{"field_id": "f0", "value": "Jane", "needs_review": false, "reasoning": ""}]',
     )
     fields = [FormField("f0", "First Name", "text", "sel0")]
 

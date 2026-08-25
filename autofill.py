@@ -34,6 +34,14 @@ import mapping_cache
 LLM_PROVIDER = os.environ.get("AUTOFILL_LLM_PROVIDER", "ollama")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 ANTHROPIC_MODEL = "claude-sonnet-5"
+# Local vision model used only as a last-resort fallback (see
+# _vision_find_apply_button_text) when a page has no fillable fields AND no
+# Apply-style button was found via the normal accessibility-tree search --
+# some ATS platforms render their Apply control as something Playwright's
+# role-based query can't see (a styled <div>, a custom web component, etc.)
+# even though it's plainly visible on screen.
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
+VISION_TIMEOUT_SECONDS = int(os.environ.get("AUTOFILL_VISION_TIMEOUT", "60"))
 # Applies per batch (see MAPPING_BATCH_SIZE), not to the form as a whole --
 # fields are mapped and filled one batch at a time, so a slow/stuck batch
 # only costs its own fields, not the whole form's progress.
@@ -384,16 +392,35 @@ def _call_anthropic(user_content: str) -> str:
     return message.content[0].text
 
 
-def _call_ollama(user_content: str) -> str:
+def _call_ollama(user_content: str, num_predict: int = 4096) -> str:
     import ollama
     response = ollama.chat(
         model=OLLAMA_MODEL,
         format="json",
-        options={"num_predict": 4096},
+        options={"num_predict": num_predict},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
+    )
+    return response["message"]["content"]
+
+
+APPLY_VISION_PROMPT = (
+    "You are looking at a screenshot of a job application webpage. Is there a "
+    "button or link visible whose purpose is to start or begin a job "
+    "application -- for example labeled something like \"Apply\", \"Apply Now\", "
+    "\"Apply for this Job\", \"Start Application\", or similar? "
+    "If yes, reply with ONLY its exact visible text and nothing else. "
+    "If there is no such button or link visible, reply with exactly: NONE"
+)
+
+
+def _call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
+    import ollama
+    response = ollama.chat(
+        model=OLLAMA_VISION_MODEL,
+        messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
     )
     return response["message"]["content"]
 
@@ -409,7 +436,19 @@ def get_mappings(fields: list[FormField], profile: dict[str, Any]) -> list[dict[
         "Map each field to a value per the rules above."
     )
 
-    text = _call_ollama(user_content) if LLM_PROVIDER == "ollama" else _call_anthropic(user_content)
+    if LLM_PROVIDER == "ollama":
+        # A fixed 4096-token ceiling measurably slows local CPU inference on
+        # small batches -- the model keeps "room" to ramble before settling
+        # into the JSON even when the actual answer is short. Scaling the
+        # cap to the batch size (~220 tokens/field covers a value + short
+        # reasoning sentence each, from observed output) cuts real latency
+        # without truncating legitimate output -- worst case a batch that
+        # somehow needs more just runs out and fails json.loads() below,
+        # which is already handled like any other malformed-response failure.
+        num_predict = min(4096, max(800, len(fields) * 220 + 300))
+        text = _call_ollama(user_content, num_predict=num_predict)
+    else:
+        text = _call_anthropic(user_content)
     text = text.strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     parsed = json.loads(text)
@@ -979,6 +1018,63 @@ async def dismiss_cookie_banner(page: Page) -> bool:
     return False
 
 
+async def _vision_find_apply_button_text(page: Page) -> str | None:
+    """Last-resort fallback for when a page has no fillable fields AND
+    find_entry_button's accessibility-tree search came up empty -- some ATS
+    platforms render their Apply control as something Playwright's
+    role-based query can't see (a styled <div>, a custom web component,
+    etc.) even though it's plainly visible on screen. Asks a local vision
+    model to read a screenshot directly and report the button's visible
+    text; returns None (rather than raising) on any failure, since this is
+    only ever a fallback on top of the normal DOM-based search, never the
+    primary path. Never clicks anything itself or acts on guessed pixel
+    coordinates -- the caller still has to find a real Playwright locator
+    matching the reported text (see _click_by_visible_text)."""
+    try:
+        screenshot = await page.screenshot(type="jpeg", quality=70)
+    except Exception:
+        return None
+    if not screenshot:
+        return None
+
+    try:
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(_call_ollama_vision, screenshot, APPLY_VISION_PROMPT),
+            timeout=VISION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+
+    answer = answer.strip().strip('"').strip("'")
+    if not answer or answer.upper().startswith("NONE"):
+        return None
+    return answer
+
+
+async def _click_by_visible_text(page: Page, text: str, timeout: int = 5000) -> bool:
+    """Click the first visible element matching this text -- broader than
+    find_entry_button's strict name-list/pattern matching, since this is
+    only ever used for text a vision model already confirmed is a real,
+    on-screen Apply-style control (see _vision_find_apply_button_text), not
+    for guessing at arbitrary page text."""
+    for role in ("button", "link"):
+        locator = page.get_by_role(role, name=text, exact=False)
+        if await locator.count() > 0:
+            try:
+                await locator.first.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+    locator = page.get_by_text(text, exact=False)
+    if await locator.count() > 0:
+        try:
+            await locator.first.click(timeout=timeout)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 async def _peek_combobox_options(page: Page, selector: str) -> list[str]:
     """Open a combobox and read whatever options are already rendered,
     without typing or selecting anything -- a starting list to show a human
@@ -1232,6 +1328,21 @@ async def autofill_form_multistep(
         if not fields:
             if await _only_third_party_apply_available(page):
                 login_required = True
+                break
+            # Only worth the extra latency of a vision-model screenshot check
+            # on the very first step -- by later steps we're already past
+            # whatever entry gate this page has, and an empty step there
+            # legitimately just means the form is done (e.g. only a Submit
+            # button left, which this automation never clicks anyway).
+            if step == 0:
+                vision_button_text = await _vision_find_apply_button_text(page)
+                if vision_button_text is not None:
+                    log(f"  No Apply button found via the normal page inspection, but a "
+                        f"vision check spotted something labeled \"{vision_button_text}\" -- trying that.")
+                    if await _click_by_visible_text(page, vision_button_text):
+                        await _settle(page)
+                        continue
+                    log(f"  Couldn't click \"{vision_button_text}\" after all.")
             break
 
         await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
@@ -1259,6 +1370,21 @@ async def autofill_form_multistep(
         except Exception:
             break
         await _settle(page)
+
+    # An all-empty result (nothing filled, nothing flagged, no errors) reads
+    # as unqualified success to a caller -- correct when a form was already
+    # fully filled by an earlier step and the last step just has a Submit
+    # button left, but misleading if this loop actually never managed to
+    # fill or even find anything at all (e.g. an Apply button that couldn't
+    # be found or clicked, even after the vision fallback above). Only flag
+    # it when nothing whatsoever was accomplished across the whole call --
+    # a login_required result already explains itself to the caller.
+    if not login_required and not (all_filled or all_needs_review or all_errors):
+        all_errors.append({
+            "label": "(page)",
+            "error": "No form fields or Apply-style button could be found on this page -- "
+                     "check the browser window.",
+        })
 
     return AutofillResult(
         filled=all_filled, needs_review=all_needs_review, errors=all_errors, login_required=login_required
