@@ -306,12 +306,22 @@ async def run_automation(
                 applying_current_page = answer in ("apply current", "apply_current")
                 if applying_current_page:
                     # Skip jobright's own listing-page machinery entirely --
-                    # page IS the application, whatever it currently is,
-                    # navigated there by hand rather than through jobright.
+                    # whatever page you navigated to by hand is the
+                    # application. That's not necessarily page itself,
+                    # though: opening a new tab to browse there (rather than
+                    # navigating the original jobright tab in place) is at
+                    # least as natural, and page would then still show
+                    # jobright's own URL, never having moved. Any tab this
+                    # run doesn't already know about is a much better guess
+                    # at "the one you just navigated to" than always
+                    # assuming page -- and the most recently opened one if
+                    # there's more than one, since that's most likely to be
+                    # what you just switched to.
                     i += 1
                     job_id = f"manual-{i}"
-                    company_page = page
-                    log(f"[{i}] Applying to whatever's currently open: {page.url}")
+                    unknown_pages = [p for p in page.context.pages if p not in known_pages]
+                    company_page = unknown_pages[-1] if unknown_pages else page
+                    log(f"[{i}] Applying to whatever's currently open: {company_page.url}")
                 else:
                     if "/jobs/info/" not in page.url:
                         # jobright's navigation after clicking a listing isn't instant --
@@ -471,7 +481,7 @@ async def run_automation(
                         # not just when the application ends up fully ready to submit. You
                         # might be away from the browser and want to know it's done either way.
                         if login_popup is not None:
-                            log(f"[{i}] A login window opened -- log in "
+                            log(f"[{i}] A login window opened ({login_popup.url}) -- log in "
                                 f"yourself, then close it and retry autofill.")
                             notify(f"[{i}] A login window opened -- log in "
                                    f"yourself to continue.")
