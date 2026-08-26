@@ -28,10 +28,11 @@ def test_bridge_confirm_fn_blocks_until_response():
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    kind, prompt, response, retryable = bridge.events.get(timeout=2)
+    kind, prompt, response, retryable, allow_apply_current = bridge.events.get(timeout=2)
     assert kind == "confirm"
     assert prompt == "please confirm"
     assert retryable is False
+    assert allow_apply_current is False
     assert not done.is_set()  # still blocked
 
     response.put(None)
@@ -111,7 +112,9 @@ def test_start_streams_log_confirm_ask_finished(monkeypatch):
             assert msg["type"] == "frame"
 
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "please confirm", "retryable": False}
+            assert msg == {
+                "type": "confirm", "prompt": "please confirm", "retryable": False, "allow_apply_current": False,
+            }
 
             ws.send_json({"type": "confirm_response"})
 
@@ -217,7 +220,9 @@ def test_reset_answers_pending_confirm_with_reset_sentinel(monkeypatch):
             msg = ws.receive_json()
             assert msg == {"type": "log", "text": "run starting"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "waiting for input", "retryable": False}
+            assert msg == {
+                "type": "confirm", "prompt": "waiting for input", "retryable": False, "allow_apply_current": False,
+            }
 
             resp = client.post("/reset")
             assert resp.status_code == 200
@@ -226,6 +231,36 @@ def test_reset_answers_pending_confirm_with_reset_sentinel(monkeypatch):
             assert msg == {"type": "log", "text": "got action: reset"}
             msg = ws.receive_json()
             assert msg["type"] == "finished"
+
+
+def test_apply_current_action_reaches_worker_thread(monkeypatch):
+    # The "Apply to Current Page" button skips jobright's listing pages
+    # entirely (see main.run_automation's confirm_or_reset docs) -- proves
+    # allow_apply_current makes it all the way from confirm_fn's call
+    # through the WebSocket and back as the "apply_current" answer.
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+
+    async def apply_current_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                        num_listings=5, max_steps=6, should_reset=None):
+        action = confirm_fn("Browse listings, or apply to whatever's open", allow_apply_current=True)
+        log(f"got action: {action}")
+
+    app = webapp.create_app(run_automation_fn=apply_current_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+            client.post("/start")
+
+            msg = ws.receive_json()
+            assert msg == {
+                "type": "confirm", "prompt": "Browse listings, or apply to whatever's open",
+                "retryable": False, "allow_apply_current": True,
+            }
+
+            ws.send_json({"type": "confirm_response", "action": "apply_current"})
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "got action: apply_current"}
 
 
 def test_reset_flags_soft_reset_when_nothing_pending(monkeypatch):
@@ -261,6 +296,48 @@ def test_reset_flags_soft_reset_when_nothing_pending(monkeypatch):
             assert msg == {"type": "log", "text": "reset flag observed"}
 
 
+def test_reset_skips_pending_ask_instead_of_hanging_forever(monkeypatch):
+    # Regression: clicking Reset while a per-field review ("ask") prompt is
+    # showing must not leave the worker thread permanently blocked inside
+    # ask_fn's response.get() -- the frontend hides the ask panel on Reset
+    # regardless of what the backend does, so there'd be no way to ever
+    # answer it afterward, and the whole run would silently freeze. It
+    # should skip that one field (like the review panel's own Skip button)
+    # and flag the reset for should_reset() to pick up right after.
+    monkeypatch.setattr(webapp, "load_profile", lambda: {})
+
+    async def ask_then_poll_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
+                                        num_listings=5, max_steps=6, should_reset=None):
+        log("run starting")
+        answer = ask_fn({"label": "Mystery Field", "reasoning": "test", "type": "text", "options": []})
+        log(f"got answer: {answer!r}")
+        for _ in range(100):
+            if should_reset():
+                log("reset flag observed")
+                return
+            await asyncio.sleep(0.02)
+        log("reset flag never observed")
+
+    app = webapp.create_app(run_automation_fn=ask_then_poll_automation)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial state
+            client.post("/start")
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "run starting"}
+            msg = ws.receive_json()
+            assert msg["type"] == "ask"
+
+            resp = client.post("/reset")
+            assert resp.status_code == 200
+
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "got answer: ''"}
+            msg = ws.receive_json()
+            assert msg == {"type": "log", "text": "reset flag observed"}
+
+
 def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
     # Mirrors main.run_automation's actual retry loop shape: a retryable
     # confirm whose "retry" answer re-runs the fill step and asks again,
@@ -287,14 +364,20 @@ def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
             msg = ws.receive_json()
             assert msg == {"type": "log", "text": "filled attempt 1"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "Review the form, or retry", "retryable": True}
+            assert msg == {
+                "type": "confirm", "prompt": "Review the form, or retry", "retryable": True,
+                "allow_apply_current": False,
+            }
 
             ws.send_json({"type": "confirm_response", "action": "retry"})
 
             msg = ws.receive_json()
             assert msg == {"type": "log", "text": "filled attempt 2"}
             msg = ws.receive_json()
-            assert msg == {"type": "confirm", "prompt": "Review the form, or retry", "retryable": True}
+            assert msg == {
+                "type": "confirm", "prompt": "Review the form, or retry", "retryable": True,
+                "allow_apply_current": False,
+            }
 
             ws.send_json({"type": "confirm_response", "action": "continue"})
 

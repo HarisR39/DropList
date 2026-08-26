@@ -70,9 +70,9 @@ class AutomationBridge:
     def _log(self, message: str) -> None:
         self.events.put(("log", message))
 
-    def _confirm_fn(self, prompt: str, retryable: bool = False) -> str:
+    def _confirm_fn(self, prompt: str, retryable: bool = False, allow_apply_current: bool = False) -> str:
         response: queue.Queue = queue.Queue()
-        self.events.put(("confirm", prompt, response, retryable))
+        self.events.put(("confirm", prompt, response, retryable, allow_apply_current))
         return response.get()  # blocks the worker thread until the browser answers
 
     def _ask_fn(self, item: dict) -> str:
@@ -157,14 +157,23 @@ class AutomationBridge:
         pending, by answering it with a "reset" sentinel run_automation
         recognizes. An "ask" prompt (a per-field review question -- its
         answer becomes literal form text, not a sentinel run_automation
-        would understand) or no pending prompt at all instead just flags
-        the request; it's picked up via should_reset() as soon as
-        run_automation reaches its next confirm() pause."""
+        would understand) is instead skipped, the same as the review
+        panel's own Skip button -- answering it with "reset" or leaving it
+        unanswered would either corrupt that field's value or leave the
+        worker thread blocked forever inside ask_fn's response.get(),
+        waiting for an answer nothing would ever send (the frontend hides
+        the ask panel on Reset regardless, so there'd be no way to answer
+        it afterward either). Either way, the actual reset is flagged for
+        should_reset() to pick up as soon as run_automation reaches its
+        next confirm() pause -- immediately after the skipped field in the
+        "ask" case, or whenever nothing at all was pending."""
         if not self.is_running:
             return False
         if self._pending is not None and self._pending["kind"] == "confirm":
             self.submit_response("confirm", "reset")
         else:
+            if self._pending is not None and self._pending["kind"] == "ask":
+                self.submit_response("ask", "")
             self._soft_reset_requested.set()
         return True
 
@@ -188,10 +197,16 @@ class AutomationBridge:
             self._last_frame = event[1]
             message = {"type": "frame", "data": event[1]}
         elif kind == "confirm":
-            _, prompt, response, retryable = event
-            self._pending = {"kind": "confirm", "prompt": prompt, "retryable": retryable}
+            _, prompt, response, retryable, allow_apply_current = event
+            self._pending = {
+                "kind": "confirm", "prompt": prompt, "retryable": retryable,
+                "allow_apply_current": allow_apply_current,
+            }
             self._pending_response = response
-            message = {"type": "confirm", "prompt": prompt, "retryable": retryable}
+            message = {
+                "type": "confirm", "prompt": prompt, "retryable": retryable,
+                "allow_apply_current": allow_apply_current,
+            }
         elif kind == "ask":
             _, item, response = event
             self._pending = {"kind": "ask", "item": item}

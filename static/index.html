@@ -122,6 +122,7 @@
       </div>
       <div id="confirm-banner">
         <div id="confirm-text"></div>
+        <button id="apply-current-btn" class="btn-secondary" style="display:none;">Apply to Current Page</button>
         <button id="retry-btn" class="btn-secondary" style="display:none;">Retry Autofill</button>
         <button id="confirm-btn" class="btn-primary">Continue</button>
       </div>
@@ -158,6 +159,7 @@ const reviewPanel = document.getElementById("review-panel");
 const reviewLabel = document.getElementById("review-label");
 const reviewReason = document.getElementById("review-reason");
 const retryBtn = document.getElementById("retry-btn");
+const applyCurrentBtn = document.getElementById("apply-current-btn");
 const reviewOptions = document.getElementById("review-options");
 const reviewSubmit = document.getElementById("review-submit");
 const reviewSkip = document.getElementById("review-skip");
@@ -192,9 +194,10 @@ function showFrame(base64Data) {
   viewPlaceholder.style.display = "none";
 }
 
-function showConfirm(prompt, retryable) {
+function showConfirm(prompt, retryable, allowApplyCurrent) {
   confirmText.textContent = prompt;
   retryBtn.style.display = retryable ? "inline-block" : "none";
+  applyCurrentBtn.style.display = allowApplyCurrent ? "inline-block" : "none";
   confirmBanner.classList.add("visible");
 }
 
@@ -298,7 +301,7 @@ function connect() {
         setRunningUI(!!msg.running);
         setStatus(msg.running ? "running" : null, msg.running ? "running" : "idle");
         if (msg.pending) {
-          if (msg.pending.kind === "confirm") showConfirm(msg.pending.prompt, msg.pending.retryable);
+          if (msg.pending.kind === "confirm") showConfirm(msg.pending.prompt, msg.pending.retryable, msg.pending.allow_apply_current);
           else if (msg.pending.kind === "ask") showAsk(msg.pending.item);
         }
         break;
@@ -311,7 +314,7 @@ function connect() {
       case "confirm":
         setRunningUI(true);
         setStatus("running", "waiting for you");
-        showConfirm(msg.prompt, msg.retryable);
+        showConfirm(msg.prompt, msg.retryable, msg.allow_apply_current);
         break;
       case "ask":
         setRunningUI(true);
@@ -376,6 +379,12 @@ retryBtn.addEventListener("click", () => {
   hideConfirm();
   setStatus("running", "running");
   ws.send(JSON.stringify({ type: "confirm_response", action: "retry" }));
+});
+
+applyCurrentBtn.addEventListener("click", () => {
+  hideConfirm();
+  setStatus("running", "running");
+  ws.send(JSON.stringify({ type: "confirm_response", action: "apply_current" }));
 });
 
 reviewSubmit.addEventListener("click", () => {
