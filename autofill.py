@@ -175,6 +175,17 @@ class AutofillResult:
     needs_review: list[dict[str, Any]]
     errors: list[dict[str, Any]]
     login_required: bool = False
+    # Only ever set by autofill_form_multistep, to the page it actually
+    # ended up operating on -- an Apply/Next click can open the real next
+    # step in a new tab rather than navigating in place (seen on some
+    # Greenhouse listings), and autofill_form_multistep follows that new
+    # tab internally. Compare against whatever page you passed in: if it
+    # differs, callers that track the page across calls (main.run_
+    # automation's company_page/known_pages) need to switch to it too, or
+    # they'll keep looking at the original, now-abandoned tab -- which also
+    # makes the real one look like an unrecognized extra page (see
+    # main._find_login_popup).
+    final_page: Any = None
 
 
 async def extract_fields(page: Page) -> list[FormField]:
@@ -1353,21 +1364,26 @@ async def take_frame_screenshot(page: Page) -> bytes | None:
     a max capturable canvas height) -- and not always by raising: on an
     extreme-height page it's been observed to "succeed" with a 0-byte
     result instead of throwing, so an empty result is treated as a failure
-    too, not just an exception. None of this module's on_frame call sites
-    are wrapped in error handling upstream, so letting either failure mode
-    propagate would silently kill the whole automation run right after a
-    successful fill, not just skip one frame update. Fall back to a
-    viewport-only screenshot, and give up quietly (None) only if even that
-    comes back empty or fails, rather than ever taking the run down over a
-    screenshot."""
+    too, not just an exception. A capture against certain page states (seen
+    on Chromium's own internal "New Tab" page) has also been observed to
+    stall outright rather than fail cleanly -- worse than a normal failure,
+    since an un-timed-out await can sit there indefinitely and, in that
+    specific case, was even observed blocking the tab's own subsequent
+    navigation. An explicit timeout turns that into an ordinary handled
+    failure. None of this module's on_frame call sites are wrapped in error
+    handling upstream, so letting either failure mode propagate would
+    silently kill the whole automation run right after a successful fill,
+    not just skip one frame update. Fall back to a viewport-only screenshot,
+    and give up quietly (None) only if even that comes back empty or fails,
+    rather than ever taking the run down over a screenshot."""
     try:
-        frame = await page.screenshot(type="jpeg", quality=60, full_page=True)
+        frame = await page.screenshot(type="jpeg", quality=60, full_page=True, timeout=5000)
         if frame:
             return frame
     except Exception:
         pass
     try:
-        frame = await page.screenshot(type="jpeg", quality=60)
+        frame = await page.screenshot(type="jpeg", quality=60, timeout=5000)
         return frame or None
     except Exception:
         return None
@@ -1389,6 +1405,29 @@ async def _capture_frame(
             f.write(frame_bytes)
     if on_frame is not None:
         on_frame(frame_bytes)
+
+
+async def _follow_new_tab_if_opened(page: Page, pages_before: set) -> Page:
+    """After a click that might have opened the real next step in a new tab
+    instead of navigating page in place (seen on some Greenhouse listings'
+    Apply button) -- return that new tab instead, or page itself unchanged
+    if nothing new appeared. Closes any other extras that opened alongside
+    it too (e.g. an ad/tracking redirect tab), same as main.run_automation
+    already does for its own "Original Job Post" click."""
+    new_pages = [p for p in page.context.pages if p not in pages_before]
+    if not new_pages:
+        return page
+    target = new_pages[0]
+    for extra in new_pages[1:]:
+        try:
+            await extra.close()
+        except Exception:
+            pass
+    try:
+        await target.wait_for_load_state()
+    except Exception:
+        pass
+    return target
 
 
 async def autofill_form_multistep(
@@ -1438,6 +1477,7 @@ async def autofill_form_multistep(
     third-party login on your behalf -- and returns with
     login_required=True so the caller can pause for a human instead of
     guessing."""
+    original_page = page
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
@@ -1469,6 +1509,7 @@ async def autofill_form_multistep(
 
         entry_button = await find_entry_button(page, allow_bare_apply=not real_fields)
         if entry_button is not None:
+            pages_before = set(page.context.pages)
             try:
                 await entry_button.click(timeout=5000)
             except Exception:
@@ -1479,6 +1520,10 @@ async def autofill_form_multistep(
                         break
                 else:
                     break
+            new_page = await _follow_new_tab_if_opened(page, pages_before)
+            if new_page is not page:
+                log("  Apply opened the real application in a new tab -- following it.")
+                page = new_page
             await _settle(page)
             continue
 
@@ -1522,10 +1567,15 @@ async def autofill_form_multistep(
         next_button = await find_next_button(page)
         if next_button is None:
             break
+        pages_before = set(page.context.pages)
         try:
             await next_button.click(timeout=5000)
         except Exception:
             break
+        new_page = await _follow_new_tab_if_opened(page, pages_before)
+        if new_page is not page:
+            log("  Continuing opened the next step in a new tab -- following it.")
+            page = new_page
         await _settle(page)
 
     # An all-empty result (nothing filled, nothing flagged, no errors) reads
@@ -1544,7 +1594,8 @@ async def autofill_form_multistep(
         })
 
     return AutofillResult(
-        filled=all_filled, needs_review=all_needs_review, errors=all_errors, login_required=login_required
+        filled=all_filled, needs_review=all_needs_review, errors=all_errors, login_required=login_required,
+        final_page=page if page is not original_page else None,
     )
 
 

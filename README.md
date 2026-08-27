@@ -43,7 +43,7 @@ Install the ntfy app, subscribe to a topic of your choosing (pick something rand
 
 ## Setup
 
-Requires Python 3.12+ and [Ollama](https://ollama.com) (for local, free LLM inference) or an Anthropic API key.
+Requires Python 3.12+, [Ollama](https://ollama.com) (for local, free LLM inference) or an Anthropic API key, and **Google Chrome installed** (not just Playwright's bundled Chromium -- the automation drives your real, installed Chrome so it looks like an ordinary browser to sites with bot detection, rather than a fresh, obviously-automated profile).
 
 ```bash
 pip install -r requirements.txt

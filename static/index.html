@@ -369,36 +369,23 @@ resetBtn.addEventListener("click", async () => {
   }
 });
 
-confirmBtn.addEventListener("click", () => {
+function sendConfirmResponse(action) {
   hideConfirm();
   setStatus("running", "running");
-  ws.send(JSON.stringify({ type: "confirm_response", action: "continue" }));
-});
+  ws.send(JSON.stringify({ type: "confirm_response", action }));
+}
 
-retryBtn.addEventListener("click", () => {
-  hideConfirm();
-  setStatus("running", "running");
-  ws.send(JSON.stringify({ type: "confirm_response", action: "retry" }));
-});
-
-applyCurrentBtn.addEventListener("click", () => {
-  hideConfirm();
-  setStatus("running", "running");
-  ws.send(JSON.stringify({ type: "confirm_response", action: "apply_current" }));
-});
-
-reviewSubmit.addEventListener("click", () => {
-  const answer = collectAskAnswer();
+function sendAskResponse(answer) {
   hideAsk();
   setStatus("running", "running");
   ws.send(JSON.stringify({ type: "ask_response", answer }));
-});
+}
 
-reviewSkip.addEventListener("click", () => {
-  hideAsk();
-  setStatus("running", "running");
-  ws.send(JSON.stringify({ type: "ask_response", answer: "" }));
-});
+confirmBtn.addEventListener("click", () => sendConfirmResponse("continue"));
+retryBtn.addEventListener("click", () => sendConfirmResponse("retry"));
+applyCurrentBtn.addEventListener("click", () => sendConfirmResponse("apply_current"));
+reviewSubmit.addEventListener("click", () => sendAskResponse(collectAskAnswer()));
+reviewSkip.addEventListener("click", () => sendAskResponse(""));
 
 connect();
 </script>

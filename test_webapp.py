@@ -83,7 +83,7 @@ def test_bridge_start_returns_false_when_already_running():
 # FastAPI TestClient: drives a fake run_automation_fn through /start, /ws, /stop.
 
 async def fake_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                           num_listings=5, max_steps=6, should_reset=None):
+                           max_steps=6, should_reset=None):
     log("starting")
     if on_frame:
         on_frame(b"fake-frame-bytes")
@@ -138,7 +138,7 @@ def test_start_twice_returns_409(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def slow_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                               num_listings=5, max_steps=6, should_reset=None):
+                               max_steps=6, should_reset=None):
         confirm_fn("blocking forever until stopped")
 
     app = webapp.create_app(run_automation_fn=slow_automation)
@@ -206,7 +206,7 @@ def test_reset_answers_pending_confirm_with_reset_sentinel(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def confirm_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                  num_listings=5, max_steps=6, should_reset=None):
+                                  max_steps=6, should_reset=None):
         log("run starting")
         action = confirm_fn("waiting for input")
         log(f"got action: {action}")
@@ -241,7 +241,7 @@ def test_apply_current_action_reaches_worker_thread(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def apply_current_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                        num_listings=5, max_steps=6, should_reset=None):
+                                        max_steps=6, should_reset=None):
         action = confirm_fn("Browse listings, or apply to whatever's open", allow_apply_current=True)
         log(f"got action: {action}")
 
@@ -271,7 +271,7 @@ def test_reset_flags_soft_reset_when_nothing_pending(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def polling_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                  num_listings=5, max_steps=6, should_reset=None):
+                                  max_steps=6, should_reset=None):
         log("run starting")
         for _ in range(100):
             if should_reset():
@@ -307,7 +307,7 @@ def test_reset_skips_pending_ask_instead_of_hanging_forever(monkeypatch):
     monkeypatch.setattr(webapp, "load_profile", lambda: {})
 
     async def ask_then_poll_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                        num_listings=5, max_steps=6, should_reset=None):
+                                        max_steps=6, should_reset=None):
         log("run starting")
         answer = ask_fn({"label": "Mystery Field", "reasoning": "test", "type": "text", "options": []})
         log(f"got answer: {answer!r}")
@@ -346,7 +346,7 @@ def test_retry_confirm_response_loops_back_before_continuing(monkeypatch):
     fill_count = {"n": 0}
 
     async def retry_loop_automation(profile, log=print, confirm_fn=None, ask_fn=None, on_frame=None,
-                                     num_listings=5, max_steps=6, should_reset=None):
+                                     max_steps=6, should_reset=None):
         while True:
             fill_count["n"] += 1
             log(f"filled attempt {fill_count['n']}")

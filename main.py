@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -35,11 +36,27 @@ def _is_job_board_domain(url: str) -> bool:
     return any(netloc == domain or netloc.endswith("." + domain) for domain in JOB_BOARD_DOMAINS)
 
 
+async def _dismiss_exit_button(page) -> None:
+    """Close jobright's own "EXIT" control if it's showing (a modal/tour
+    dismiss button, distinct from the reactour overlay's own Escape-key
+    handling below it) -- checked at a couple of points during the listing
+    hand-off since it can appear more than once in that sequence."""
+    exit_button = page.get_by_text("EXIT", exact=True)
+    if await exit_button.count() > 0:
+        await exit_button.first.click()
+
+
 class _ResetRequested(Exception):
     """Raised internally (see confirm_or_reset) to unwind out of however
     deeply nested the current listing's retry/did-you-apply loops are and
     land back at the top of the job-picking loop, without tearing down the
     browser/session the way stopping and restarting the whole run would."""
+
+
+class _StopRequested(Exception):
+    """Raised by _pick_target_page when you're done for the session --
+    unwinds the same way _ResetRequested does, straight to run_automation's
+    own job-picking loop, which ends the run instead of looping again."""
 
 
 def load_profile() -> dict:
@@ -110,54 +127,366 @@ async def _live_view_loop(current_page: dict, on_frame: Callable[[bytes], None])
             on_frame(frame_bytes)
 
 
-def _watch_page_navigation(watched_page, on_frame: Callable[[bytes], None]) -> None:
-    """Capture a frame right after watched_page's main frame finishes
-    navigating (URL change, redirect, etc.) -- one of the three concrete,
-    visible-change triggers this is meant to catch immediately rather than
-    waiting on _live_view_loop's timer (the other two are per-field fills,
-    handled inside autofill.apply_mapping, and new tabs, handled by
-    _watch_new_pages below). Scoped to the main frame only -- ATS pages
-    commonly embed ad/tracking/chat-widget iframes that navigate on their
-    own and would otherwise spam captures unrelated to anything visible in
-    the actual application."""
-    async def _on_navigated(frame) -> None:
-        if frame != watched_page.main_frame:
-            return
-        # The new page typically hasn't painted anything yet the instant
-        # this fires -- a beat for the first paint makes for a much more
-        # useful frame than a blank/white one.
-        await watched_page.wait_for_timeout(300)
-        try:
-            frame_bytes = await take_frame_screenshot(watched_page)
-        except Exception:
-            return
-        if frame_bytes is not None:
-            on_frame(frame_bytes)
+def _redirect_new_tabs_away_from_ntp(context) -> None:
+    """Immediately navigate any tab opened in this browser context to
+    about:blank, racing in before Chrome's own real New Tab Page
+    (chrome://newtab/) gets a chance to do anything.
 
-    watched_page.on("framenavigated", _on_navigated)
-
-
-def _watch_new_pages(context, current_page: dict, on_frame: Callable[[bytes], None]) -> None:
-    """Capture a frame -- and start navigation-watching it too -- as soon as
-    any new tab/popup opens anywhere in this browser context (a company
-    page, an OAuth login popup, an ad redirect, etc.), and repoint
-    current_page at it so _live_view_loop's own timer follows it from then
-    on. Registered once, up front, on the context itself, rather than
-    per-page -- Playwright fires this for every page ever created in the
-    context afterward, so this needs no re-registration as new tabs come
-    and go over the course of a run."""
+    Only a tab YOU open by hand (Ctrl+T, the + button) ever lands on that
+    real NTP in the first place -- Playwright's own new_page() bypasses it
+    entirely and starts on about:blank already, confirmed directly: calling
+    it produces a page whose .url is "about:blank", never
+    "chrome://newtab/". Chrome's real NTP fetches a Discover feed and
+    suggested-sites content from Google's own servers, and under this
+    automation's fresh, sync-free profile that fetch has been observed to
+    hang indefinitely -- which then seems to leave that tab's renderer
+    unable to complete ANY navigation you make in it afterward (matches
+    exactly what was reported: reusing an already-loaded tab like
+    jobright's own works fine; a freshly hand-opened one doesn't). Skipping
+    the NTP's own network activity entirely, by never actually letting it
+    run, sidesteps the problem rather than trying to debug it -- there's no
+    way to script/observe the real NTP the way a human's Ctrl+T actually
+    triggers it, so this couldn't be verified more directly than that."""
     async def _on_new_page(new_page) -> None:
-        current_page["page"] = new_page
-        _watch_page_navigation(new_page, on_frame)
-        await new_page.wait_for_timeout(300)
         try:
-            frame_bytes = await take_frame_screenshot(new_page)
+            await new_page.goto("about:blank", timeout=3000)
         except Exception:
-            return
-        if frame_bytes is not None:
-            on_frame(frame_bytes)
+            pass
 
     context.on("page", _on_new_page)
+
+
+async def _pick_target_page(page, known_pages: set, i: int, confirm_or_reset, log):
+    """Show the "browse listings" pause and resolve it into a page to
+    autofill. Returns (company_page, job_id, applying_current_page, i) once
+    there's something to work with, or None if the pause should just be
+    shown again (e.g. you haven't actually clicked into a jobright listing
+    yet). Raises _StopRequested/_ResetRequested for those two responses --
+    the caller's job-picking loop is expected to end the run on the former
+    and handle the latter exactly like it already does everywhere else.
+
+    company_page is page itself (not a separate tab) when you typed 'apply
+    current' -- see run_automation's docstring -- unless you opened a new
+    tab to browse there instead of navigating page in place, in which case
+    it's the most recently opened tab this run doesn't already know about
+    (page would otherwise still show jobright's own URL, having never
+    moved)."""
+    answer = (confirm_or_reset(
+        "Logged into jobright.ai. Browse the recommended listings yourself "
+        "and click into whichever one you'd like to apply to, through to "
+        "its job detail page, then press Enter here (or click Continue) "
+        "and this will take over from there -- click Apply, autofill the "
+        "form, and pause for your review. Or navigate anywhere yourself -- a "
+        "company's application page you found outside jobright -- and type "
+        "'apply current' and press Enter (or use Apply to Current Page) to "
+        "autofill whatever's open right now, skipping jobright's listing pages "
+        "entirely. Type 'stop' and press Enter (or use Stop) to end this "
+        "session whenever you're done applying.",
+        allow_apply_current=True,
+    ) or "").strip().lower()
+    if answer == "stop":
+        raise _StopRequested()
+    if answer == "reset":
+        raise _ResetRequested()
+
+    if answer in ("apply current", "apply_current"):
+        i += 1
+        job_id = f"manual-{i}"
+        unknown_pages = [p for p in page.context.pages if p not in known_pages]
+        company_page = unknown_pages[-1] if unknown_pages else page
+        log(f"[{i}] Applying to whatever's currently open: {company_page.url}")
+        return company_page, job_id, True, i
+
+    if "/jobs/info/" not in page.url:
+        # jobright's navigation after clicking a listing isn't instant --
+        # checking page.url the moment you click Continue can catch it
+        # mid-navigation and wrongly report "not on a job page yet" even
+        # though you did click one. Give it a couple seconds to actually
+        # land before giving up.
+        try:
+            await page.wait_for_url("**/jobs/info/**", timeout=3000)
+        except Exception:
+            pass
+
+    if "/jobs/info/" not in page.url:
+        log(f"Doesn't look like you're on a job listing page yet (current "
+            f"URL: {page.url}) -- click into a listing, then continue again.")
+        return None
+
+    i += 1
+    job_id = page.url.rsplit("/jobs/info/", 1)[-1].split("?")[0]
+
+    await _dismiss_exit_button(page)
+
+    # A full-screen onboarding-tour overlay (jobright's reactour-based
+    # walkthrough) can appear here and intercept every click for 30s
+    # until Playwright gives up. Only press Escape if it's actually
+    # present -- on this page Escape is also jobright's own shortcut
+    # to close the job detail view entirely, which would remove the
+    # apply button from the DOM before we ever click it.
+    if await page.query_selector("#___reactour") is not None:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+
+    # "Original Job Post" links out to the job's original source posting
+    # (the company's own careers page) in a new tab -- unlike "Apply with
+    # Autofill", it never shows jobright's own "Customize Your Resume"
+    # modal.
+    pages_before = set(page.context.pages)
+    try:
+        async with page.context.expect_page(timeout=15000) as new_page_info:
+            await page.get_by_text("Original Job Post", exact=True).click()
+        company_page = await new_page_info.value
+    except Exception:
+        company_page = None
+    await page.wait_for_timeout(800)
+
+    await _dismiss_exit_button(page)
+
+    if company_page is not None:
+        # A single click can occasionally open more than one new tab (e.g.
+        # an ad/tracking redirect alongside the real destination) -- close
+        # the extras immediately so they don't clutter the browser or get
+        # mistaken for a genuine login popup later (see _find_login_popup).
+        for extra in page.context.pages:
+            if extra not in pages_before and extra is not company_page:
+                try:
+                    await extra.close()
+                except Exception:
+                    pass
+        await company_page.wait_for_load_state()
+        log(f"[{i}] Company page opened: {company_page.url}")
+    else:
+        log(f"[{i}] No resume-customize popup or new tab appeared; "
+            f"check the browser window.")
+
+    return company_page, job_id, False, i
+
+
+def _handle_reset_or_retry(action: str, company_page, i: int, log) -> bool:
+    """Common tail of every confirm_or_reset() answer inside
+    _fill_review_retry_loop: raises _ResetRequested for 'reset' (same as
+    every other confirm_or_reset call site), or returns True for 'retry'
+    when there's a company_page to retry on -- the caller's loop is
+    expected to `continue` when this returns True. False means neither:
+    just move on to whatever's next."""
+    normalized = (action or "").strip().lower()
+    if normalized == "reset":
+        raise _ResetRequested()
+    if company_page is not None and normalized == "retry":
+        log(f"[{i}] Retrying autofill on the same page...")
+        return True
+    return False
+
+
+async def _fill_review_retry_loop(
+    page, company_page, known_pages: set, current_page: dict, job_id: str, i: int,
+    profile: dict, max_steps: int, confirm_or_reset, ask_fn, on_frame, log,
+):
+    """Runs autofill_form_multistep against company_page, then pauses for
+    review -- retry (a fresh autofill_form_multistep pass on the same page)
+    always available, plus jobright's own "Did you apply?" popup on page
+    (the ORIGINAL jobright tab, not company_page) afterward, when that's
+    even relevant. Loops on 'retry' from ANY of these pauses, not just the
+    main review one -- the point is you can trigger a fresh attempt
+    whenever you want, not only right after one's already failed.
+
+    Returns the possibly-updated company_page: an Apply/Next click inside
+    autofill_form_multistep can switch to a new tab (see autofill.
+    AutofillResult.final_page), and the caller needs that to decide what
+    page to navigate back from afterward. Raises _ResetRequested exactly
+    like confirm_or_reset callers always have."""
+    while True:
+        result = None
+        login_popup = None
+
+        if company_page is not None:
+            # let redirects/dynamic content settle before reading the form.
+            # Some career sites never go fully network-idle (analytics
+            # beacons, chat widgets, etc.), so don't let that hang/kill
+            # the whole run.
+            try:
+                await company_page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            await company_page.wait_for_timeout(1500)
+
+            if _is_job_board_domain(company_page.url):
+                # This is a job board's own repost, not the company's
+                # site -- its "Apply"/"Continue" buttons lead into
+                # that board's own account signup/login (see
+                # run_automation's docstring), so don't click
+                # anything on it at all; treat it the same as any
+                # other login-required page.
+                log(f"[{i}] The original job post is hosted on "
+                    f"{urlparse(company_page.url).netloc}, not the company's own site -- "
+                    f"applying there needs an account with that site, so this automation "
+                    f"won't click anything here.")
+                result = AutofillResult(filled=[], needs_review=[], errors=[], login_required=True)
+            else:
+                login_popup = _find_login_popup(company_page, known_pages)
+
+            if login_popup is None and result is None:
+                try:
+                    result = await autofill_form_multistep(
+                        company_page,
+                        profile,
+                        profile["resume_path"],
+                        profile.get("cover_letter_path"),
+                        max_steps=max_steps,
+                        screenshot_dir=SCREENSHOT_DIR,
+                        screenshot_prefix=f"job_{job_id}",
+                        # The interactive prompts below block until someone is
+                        # actually there to answer them -- notify the moment the
+                        # AI hands off, not only after all of them are answered.
+                        on_needs_review=lambda items: notify(
+                            f"[{i}] {len(items)} field(s) need your input -- "
+                            f"come back to the terminal."
+                        ),
+                        ask_fn=ask_fn,
+                        on_frame=on_frame,
+                        log=log,
+                    )
+                except Exception as e:
+                    log(f"[{i}] Autofill failed on this page ({e}); "
+                        f"you'll need to fill it manually.")
+                    result = None
+
+                # An Apply/Next click can open the real next step in a
+                # new tab instead of navigating in place (see
+                # autofill.AutofillResult.final_page) -- follow it here
+                # too, or the old, now-abandoned tab stays what this
+                # loop (and _find_login_popup) keeps looking at, while
+                # the real one sits unrecognized and gets mistaken for
+                # a login popup.
+                if result is not None and result.final_page is not None \
+                        and result.final_page is not company_page:
+                    company_page = result.final_page
+                    known_pages.add(company_page)
+                    current_page["page"] = company_page
+
+                # autofill_form_multistep may have added new profile['custom_answers']
+                # entries from what you typed in during this listing -- persist those.
+                save_profile(profile)
+
+                # A login popup can also appear as a side effect of the fill
+                # attempt itself (e.g. clicking a "Continue with Google" button
+                # partway through a multi-step form) -- check again now.
+                login_popup = _find_login_popup(company_page, known_pages)
+
+            # Notify as soon as the AI's autofill attempt is done, one way or
+            # another -- success, needs review, failed, or blocked on login --
+            # not just when the application ends up fully ready to submit. You
+            # might be away from the browser and want to know it's done either way.
+            if login_popup is not None:
+                log(f"[{i}] A login window opened ({login_popup.url}) -- log in "
+                    f"yourself, then close it and retry autofill.")
+                notify(f"[{i}] A login window opened -- log in "
+                       f"yourself to continue.")
+            elif result is not None and result.login_required:
+                log(f"[{i}] This page looks like it wants you to log "
+                    f"into an existing account, or only offers a third-party option like "
+                    f"\"Apply with LinkedIn/GitHub\" -- handle that yourself in the "
+                    f"browser, then retry autofill.")
+                notify(f"[{i}] Looks like a login or third-party "
+                       f"apply option is needed -- handle it yourself to continue.")
+            elif result is None:
+                notify(f"[{i}] Autofill failed on this page -- "
+                       f"you'll need to fill it manually.")
+            elif result.needs_review or result.errors:
+                application_tracking.record(
+                    job_id, "needs_review", company_page.url, result.needs_review, result.errors
+                )
+                log(f"[{i}] Needs review: "
+                    f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
+                for item in result.needs_review:
+                    log(f"    - {item['label']}: {item['reasoning']}")
+                for item in result.errors:
+                    log(f"    ! {item['label']}: {item['error']}")
+                notify(f"[{i}] Filled, but {len(result.needs_review)} "
+                       f"field(s) need your review before you submit.")
+            else:
+                application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
+                log(f"[{i}] All fields filled confidently.")
+                notify(f"[{i}] Application filled and ready to review/submit.")
+
+        if on_frame is not None and company_page is not None:
+            frame_bytes = await take_frame_screenshot(company_page)
+            if frame_bytes is not None:
+                on_frame(frame_bytes)
+
+        needs_login = login_popup is not None or (result is not None and result.login_required)
+        if needs_login:
+            action = confirm_or_reset(
+                f"[{i}] It looks like this page wants you to log in, "
+                f"or only offers a third-party apply option (LinkedIn/GitHub/etc.) this "
+                f"automation won't use. Handle that yourself in the browser, then type "
+                f"'retry' and press Enter to have the AI retry autofill, or just press "
+                f"Enter to move on without retrying.",
+                retryable=True,
+            )
+        else:
+            action = confirm_or_reset(
+                f"[{i}] Review the form in the browser "
+                f"(check anything flagged above), then submit manually if it looks right. "
+                f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
+                f"retry autofill on this same page instead of moving on. Press Enter to "
+                f"continue, or type 'retry' and press Enter to retry autofill...",
+                retryable=company_page is not None,
+            )
+        if _handle_reset_or_retry(action, company_page, i, log):
+            continue
+
+        # jobright shows a "Did you apply?" popup when you switch back to this tab
+        # after visiting the company page -- that's your call to answer, not the
+        # script's, and leaving it open can block the next listing's clicks. A
+        # "retry" response from either of its own fallback pauses below also
+        # loops back to the top instead of just re-prompting the same popup.
+        did_you_apply = page.get_by_text("Did you apply", exact=False)
+        if await did_you_apply.count() == 0:
+            break
+
+        if on_frame is not None:
+            frame_bytes = await take_frame_screenshot(page)
+            if frame_bytes is not None:
+                on_frame(frame_bytes)
+        apply_options = ["Yes, I applied!", "No, I didn't apply"]
+        if ask_fn is not None:
+            # GUI mode: answer it right from the review panel instead of
+            # needing to click inside the raw (non-embedded) browser window.
+            answer = (ask_fn({
+                "label": "Did you apply?",
+                "reasoning": "jobright is asking whether you actually submitted "
+                             "the application on the company page.",
+                "type": "radio-group",
+                "options": apply_options,
+            }) or "").strip()
+            match = next((opt for opt in apply_options if opt.strip().lower() == answer.lower()), None)
+            if match is not None:
+                await page.get_by_text(match, exact=True).first.click()
+                await page.wait_for_timeout(500)
+            else:
+                action = confirm_or_reset(
+                    "Couldn't match your answer to a button -- click Yes or No "
+                    "yourself in the browser, then press Enter here to continue "
+                    "(or type 'retry' to retry autofill instead)...",
+                    retryable=company_page is not None,
+                )
+                if _handle_reset_or_retry(action, company_page, i, log):
+                    continue
+        else:
+            action = confirm_or_reset(
+                "A \"Did you apply?\" popup is open in the browser -- click Yes or "
+                "No yourself, then press Enter here to continue (or type 'retry' "
+                "to retry autofill instead)...",
+                retryable=company_page is not None,
+            )
+            if _handle_reset_or_retry(action, company_page, i, log):
+                continue
+
+        break
+
+    return company_page
 
 
 async def run_automation(
@@ -234,6 +563,11 @@ async def run_automation(
     review. Log in yourself, then choose Retry to have the AI take another
     pass, or Continue to move on without retrying."""
     confirm = confirm_fn or (lambda prompt, retryable=False, allow_apply_current=False: input(prompt))
+    # Wiped at the start of every run rather than left to accumulate --
+    # these are only ever useful for reviewing the run that's about to
+    # start, and with no cleanup otherwise, they'd just pile up on disk
+    # indefinitely across every past run.
+    shutil.rmtree(SCREENSHOT_DIR, ignore_errors=True)
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
     def confirm_or_reset(prompt: str, retryable: bool = False, allow_apply_current: bool = False) -> str:
@@ -242,8 +576,51 @@ async def run_automation(
         return confirm(prompt, retryable=retryable, allow_apply_current=allow_apply_current)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, slow_mo=50)
+        # Some real-world career sites sit behind bot detection (Cloudflare,
+        # Akamai, etc.) that doesn't show an explicit "blocked" page --
+        # instead it just silently hangs the page forever, which matches a
+        # "new tab never finishes loading" symptom that's specific to this
+        # automation's browser (the exact same URL loads fine in an
+        # everyday Chrome profile at the same time). Three things together
+        # to look like an ordinary browser instead of an obviously automated
+        # one:
+        #   - channel="chrome": drives the real, installed Google Chrome
+        #     binary (with real branding/API keys) instead of Playwright's
+        #     own bundled Chromium build.
+        #   - --disable-blink-features=AutomationControlled: removes
+        #     several automation signals Chromium otherwise exposes by
+        #     default.
+        #   - navigator.webdriver override below: belt-and-suspenders on
+        #     top of the flag above -- some Chromium versions still leave
+        #     it true otherwise, and it's one of the most commonly checked
+        #     automation fingerprints.
+        # --dns-over-https-mode=off: a brand-new Chromium profile defaults
+        # to "Automatic" Secure DNS (tries DNS-over-HTTPS first). If DoH
+        # lookups are silently blocked/time out on this network, a fresh
+        # profile hangs trying that before ever falling back to plain DNS
+        # -- unlike an established profile (this laptop's regular Chrome)
+        # that may already be configured differently. Forces plain
+        # OS-level DNS resolution instead, matching ordinary browsing.
+        browser = await p.chromium.launch(
+            channel="chrome",
+            headless=False,
+            slow_mo=50,
+            args=[
+                "--dns-over-https-mode=off",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         page = await browser.new_page()
+        # Applies to every page in this context, including tabs opened
+        # later (by the automation or by hand) -- see the launch args above
+        # for why.
+        await page.context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+        # Not gated behind on_frame (unlike the live-view watchers below) --
+        # confirmed to happen in plain terminal use too, with no webapp/live
+        # view involved at all. See _redirect_new_tabs_away_from_ntp.
+        _redirect_new_tabs_away_from_ntp(page.context)
         # {"page": ...} rather than a plain variable so _live_view_loop
         # (started right below) always picks up whichever page is currently
         # relevant on its next tick -- repointed at company_page/back to
@@ -255,14 +632,16 @@ async def run_automation(
         # not just the current listing's.
         known_pages = {page}
         live_view_task = asyncio.create_task(_live_view_loop(current_page, on_frame)) if on_frame is not None else None
-        if on_frame is not None:
-            # The three concrete, near-instant triggers: a field getting
-            # filled (autofill.apply_mapping calls on_frame itself), the
-            # open URL changing, or a new tab opening. _live_view_loop's
-            # timer above stays as a lower-frequency backstop for anything
-            # that changes without any of these three firing.
-            _watch_page_navigation(page, on_frame)
-            _watch_new_pages(page.context, current_page, on_frame)
+        # current_page is repointed explicitly at every point where the
+        # live view actually needs to follow somewhere new (picking a
+        # listing, an Apply/Next click opening a new tab mid-fill, a
+        # reset) -- deliberately NOT the instant any new tab opens
+        # anywhere in the context, including ones you open by hand
+        # yourself. That used to auto-follow every new tab immediately,
+        # which meant _live_view_loop's timer could land on (and
+        # screenshot) a tab you'd just opened and hadn't navigated
+        # anywhere yet -- observed to stall that tab's own CDP target
+        # entirely, blocking whatever you typed into it right after.
         # Pre-grant geolocation for every origin in this context so ATS sites
         # (Oracle/Taleo, Workday, etc.) that ask for it on page load never
         # trigger Chrome's native "wants to know your location" bubble --
@@ -285,317 +664,19 @@ async def run_automation(
         while True:
             company_page = None
             try:
-                answer = (confirm_or_reset(
-                    "Logged into jobright.ai. Browse the recommended listings yourself "
-                    "and click into whichever one you'd like to apply to, through to "
-                    "its job detail page, then press Enter here (or click Continue) "
-                    "and this will take over from there -- click Apply, autofill the "
-                    "form, and pause for your review. Or navigate anywhere yourself -- a "
-                    "company's application page you found outside jobright -- and type "
-                    "'apply current' and press Enter (or use Apply to Current Page) to "
-                    "autofill whatever's open right now, skipping jobright's listing pages "
-                    "entirely. Type 'stop' and press Enter (or use Stop) to end this "
-                    "session whenever you're done applying.",
-                    allow_apply_current=True,
-                ) or "").strip().lower()
-                if answer == "stop":
-                    break
-                if answer == "reset":
-                    raise _ResetRequested()
-
-                applying_current_page = answer in ("apply current", "apply_current")
-                if applying_current_page:
-                    # Skip jobright's own listing-page machinery entirely --
-                    # whatever page you navigated to by hand is the
-                    # application. That's not necessarily page itself,
-                    # though: opening a new tab to browse there (rather than
-                    # navigating the original jobright tab in place) is at
-                    # least as natural, and page would then still show
-                    # jobright's own URL, never having moved. Any tab this
-                    # run doesn't already know about is a much better guess
-                    # at "the one you just navigated to" than always
-                    # assuming page -- and the most recently opened one if
-                    # there's more than one, since that's most likely to be
-                    # what you just switched to.
-                    i += 1
-                    job_id = f"manual-{i}"
-                    unknown_pages = [p for p in page.context.pages if p not in known_pages]
-                    company_page = unknown_pages[-1] if unknown_pages else page
-                    log(f"[{i}] Applying to whatever's currently open: {company_page.url}")
-                else:
-                    if "/jobs/info/" not in page.url:
-                        # jobright's navigation after clicking a listing isn't instant --
-                        # checking page.url the moment you click Continue can catch it
-                        # mid-navigation and wrongly report "not on a job page yet" even
-                        # though you did click one. Give it a couple seconds to actually
-                        # land before giving up.
-                        try:
-                            await page.wait_for_url("**/jobs/info/**", timeout=3000)
-                        except Exception:
-                            pass
-
-                    if "/jobs/info/" not in page.url:
-                        log(f"Doesn't look like you're on a job listing page yet (current "
-                            f"URL: {page.url}) -- click into a listing, then continue again.")
-                        continue
-
-                    i += 1
-                    job_id = page.url.rsplit("/jobs/info/", 1)[-1].split("?")[0]
-
-                    exit_button = page.get_by_text("EXIT", exact=True)
-                    if await exit_button.count() > 0:
-                        await exit_button.first.click()
-
-                    # A full-screen onboarding-tour overlay (jobright's reactour-based
-                    # walkthrough) can appear here and intercept every click for 30s
-                    # until Playwright gives up. Only press Escape if it's actually
-                    # present -- on this page Escape is also jobright's own shortcut
-                    # to close the job detail view entirely, which would remove the
-                    # apply button from the DOM before we ever click it.
-                    if await page.query_selector("#___reactour") is not None:
-                        await page.keyboard.press("Escape")
-                        await page.wait_for_timeout(300)
-
-                    # "Original Job Post" links out to the job's original source
-                    # posting (the company's own careers page) in a new tab --
-                    # unlike "Apply with Autofill", it never shows jobright's own
-                    # "Customize Your Resume" modal.
-                    pages_before = set(page.context.pages)
-                    try:
-                        async with page.context.expect_page(timeout=15000) as new_page_info:
-                            await page.get_by_text("Original Job Post", exact=True).click()
-                        company_page = await new_page_info.value
-                    except Exception:
-                        company_page = None
-                    if company_page is not None:
-                        # Already done by _watch_new_pages' context "page"
-                        # listener the instant this tab was created, when one is
-                        # registered -- repeated here as a harmless no-op in
-                        # that case, and the only thing that actually does it
-                        # when on_frame (and so that listener) isn't in use.
-                        current_page["page"] = company_page
-                    await page.wait_for_timeout(800)
-
-                    exit_button = page.get_by_text("EXIT", exact=True)
-                    if await exit_button.count() > 0:
-                        await exit_button.first.click()
-
-                    if company_page is not None:
-                        # A single click can occasionally open more than one new tab
-                        # (e.g. an ad/tracking redirect alongside the real
-                        # destination) -- close the extras immediately so they don't
-                        # clutter the browser or get mistaken for a genuine login
-                        # popup later (see _find_login_popup).
-                        for extra in page.context.pages:
-                            if extra not in pages_before and extra is not company_page:
-                                try:
-                                    await extra.close()
-                                except Exception:
-                                    pass
-
-                    if company_page is not None:
-                        await company_page.wait_for_load_state()
-                        log(f"[{i}] Company page opened: {company_page.url}")
-                    else:
-                        log(f"[{i}] No resume-customize popup or new tab appeared; "
-                            f"check the browser window.")
+                picked = await _pick_target_page(page, known_pages, i, confirm_or_reset, log)
+                if picked is None:
+                    continue
+                company_page, job_id, applying_current_page, i = picked
 
                 if company_page is not None:
                     known_pages.add(company_page)
+                    current_page["page"] = company_page
 
-                # Loops back to a fresh autofill_form_multistep pass on the same
-                # company_page whenever ANY confirm() below gets an explicit
-                # "retry" response -- not just the review pause, but also the
-                # "did you apply?" fallback pauses further down. That's the point:
-                # you can trigger a fresh autofill attempt whenever you want, not
-                # only right after one has already failed or hit a login gate.
-                # Runs exactly once (no retry offered anywhere) if there's no
-                # company page.
-                while True:
-                    result = None
-                    login_popup = None
-
-                    if company_page is not None:
-                        # let redirects/dynamic content settle before reading the form.
-                        # Some career sites never go fully network-idle (analytics
-                        # beacons, chat widgets, etc.), so don't let that hang/kill
-                        # the whole run.
-                        try:
-                            await company_page.wait_for_load_state("networkidle", timeout=8000)
-                        except Exception:
-                            pass
-                        await company_page.wait_for_timeout(1500)
-
-                        if _is_job_board_domain(company_page.url):
-                            # This is a job board's own repost, not the company's
-                            # site -- its "Apply"/"Continue" buttons lead into
-                            # that board's own account signup/login (see
-                            # run_automation's docstring), so don't click
-                            # anything on it at all; treat it the same as any
-                            # other login-required page.
-                            log(f"[{i}] The original job post is hosted on "
-                                f"{urlparse(company_page.url).netloc}, not the company's own site -- "
-                                f"applying there needs an account with that site, so this automation "
-                                f"won't click anything here.")
-                            result = AutofillResult(filled=[], needs_review=[], errors=[], login_required=True)
-                        else:
-                            login_popup = _find_login_popup(company_page, known_pages)
-
-                        if login_popup is None and result is None:
-                            try:
-                                result = await autofill_form_multistep(
-                                    company_page,
-                                    profile,
-                                    profile["resume_path"],
-                                    profile.get("cover_letter_path"),
-                                    max_steps=max_steps,
-                                    screenshot_dir=SCREENSHOT_DIR,
-                                    screenshot_prefix=f"job_{job_id}",
-                                    # The interactive prompts below block until someone is
-                                    # actually there to answer them -- notify the moment the
-                                    # AI hands off, not only after all of them are answered.
-                                    on_needs_review=lambda items: notify(
-                                        f"[{i}] {len(items)} field(s) need your input -- "
-                                        f"come back to the terminal."
-                                    ),
-                                    ask_fn=ask_fn,
-                                    on_frame=on_frame,
-                                    log=log,
-                                )
-                            except Exception as e:
-                                log(f"[{i}] Autofill failed on this page ({e}); "
-                                    f"you'll need to fill it manually.")
-                                result = None
-
-                            # autofill_form_multistep may have added new profile['custom_answers']
-                            # entries from what you typed in during this listing -- persist those.
-                            save_profile(profile)
-
-                            # A login popup can also appear as a side effect of the fill
-                            # attempt itself (e.g. clicking a "Continue with Google" button
-                            # partway through a multi-step form) -- check again now.
-                            login_popup = _find_login_popup(company_page, known_pages)
-
-                        # Notify as soon as the AI's autofill attempt is done, one way or
-                        # another -- success, needs review, failed, or blocked on login --
-                        # not just when the application ends up fully ready to submit. You
-                        # might be away from the browser and want to know it's done either way.
-                        if login_popup is not None:
-                            log(f"[{i}] A login window opened ({login_popup.url}) -- log in "
-                                f"yourself, then close it and retry autofill.")
-                            notify(f"[{i}] A login window opened -- log in "
-                                   f"yourself to continue.")
-                        elif result is not None and result.login_required:
-                            log(f"[{i}] This page looks like it wants you to log "
-                                f"into an existing account, or only offers a third-party option like "
-                                f"\"Apply with LinkedIn/GitHub\" -- handle that yourself in the "
-                                f"browser, then retry autofill.")
-                            notify(f"[{i}] Looks like a login or third-party "
-                                   f"apply option is needed -- handle it yourself to continue.")
-                        elif result is None:
-                            notify(f"[{i}] Autofill failed on this page -- "
-                                   f"you'll need to fill it manually.")
-                        elif result.needs_review or result.errors:
-                            application_tracking.record(
-                                job_id, "needs_review", company_page.url, result.needs_review, result.errors
-                            )
-                            log(f"[{i}] Needs review: "
-                                f"{len(result.needs_review)} field(s), {len(result.errors)} error(s).")
-                            for item in result.needs_review:
-                                log(f"    - {item['label']}: {item['reasoning']}")
-                            for item in result.errors:
-                                log(f"    ! {item['label']}: {item['error']}")
-                            notify(f"[{i}] Filled, but {len(result.needs_review)} "
-                                   f"field(s) need your review before you submit.")
-                        else:
-                            application_tracking.record(job_id, "filled_ready_for_submit", company_page.url)
-                            log(f"[{i}] All fields filled confidently.")
-                            notify(f"[{i}] Application filled and ready to review/submit.")
-
-                    if on_frame is not None and company_page is not None:
-                        frame_bytes = await take_frame_screenshot(company_page)
-                        if frame_bytes is not None:
-                            on_frame(frame_bytes)
-
-                    needs_login = login_popup is not None or (result is not None and result.login_required)
-                    if needs_login:
-                        action = confirm_or_reset(
-                            f"[{i}] It looks like this page wants you to log in, "
-                            f"or only offers a third-party apply option (LinkedIn/GitHub/etc.) this "
-                            f"automation won't use. Handle that yourself in the browser, then type "
-                            f"'retry' and press Enter to have the AI retry autofill, or just press "
-                            f"Enter to move on without retrying.",
-                            retryable=True,
-                        )
-                    else:
-                        action = confirm_or_reset(
-                            f"[{i}] Review the form in the browser "
-                            f"(check anything flagged above), then submit manually if it looks right. "
-                            f"If a popup got in the AI's way, dismiss it yourself in the browser, then "
-                            f"retry autofill on this same page instead of moving on. Press Enter to "
-                            f"continue, or type 'retry' and press Enter to retry autofill...",
-                            retryable=company_page is not None,
-                        )
-                    if (action or "").strip().lower() == "reset":
-                        raise _ResetRequested()
-                    if company_page is not None and (action or "").strip().lower() == "retry":
-                        log(f"[{i}] Retrying autofill on the same page...")
-                        continue
-
-                    # jobright shows a "Did you apply?" popup when you switch back to this tab
-                    # after visiting the company page -- that's your call to answer, not the
-                    # script's, and leaving it open can block the next listing's clicks. A
-                    # "retry" response from either of its own fallback pauses below also
-                    # loops back to the top instead of just re-prompting the same popup.
-                    did_you_apply = page.get_by_text("Did you apply", exact=False)
-                    if await did_you_apply.count() == 0:
-                        break
-
-                    if on_frame is not None:
-                        frame_bytes = await take_frame_screenshot(page)
-                        if frame_bytes is not None:
-                            on_frame(frame_bytes)
-                    apply_options = ["Yes, I applied!", "No, I didn't apply"]
-                    if ask_fn is not None:
-                        # GUI mode: answer it right from the review panel instead of
-                        # needing to click inside the raw (non-embedded) browser window.
-                        answer = (ask_fn({
-                            "label": "Did you apply?",
-                            "reasoning": "jobright is asking whether you actually submitted "
-                                         "the application on the company page.",
-                            "type": "radio-group",
-                            "options": apply_options,
-                        }) or "").strip()
-                        match = next((opt for opt in apply_options if opt.strip().lower() == answer.lower()), None)
-                        if match is not None:
-                            await page.get_by_text(match, exact=True).first.click()
-                            await page.wait_for_timeout(500)
-                        else:
-                            action = confirm_or_reset(
-                                "Couldn't match your answer to a button -- click Yes or No "
-                                "yourself in the browser, then press Enter here to continue "
-                                "(or type 'retry' to retry autofill instead)...",
-                                retryable=company_page is not None,
-                            )
-                            if (action or "").strip().lower() == "reset":
-                                raise _ResetRequested()
-                            if company_page is not None and (action or "").strip().lower() == "retry":
-                                log(f"[{i}] Retrying autofill on the same page...")
-                                continue
-                    else:
-                        action = confirm_or_reset(
-                            "A \"Did you apply?\" popup is open in the browser -- click Yes or "
-                            "No yourself, then press Enter here to continue (or type 'retry' "
-                            "to retry autofill instead)...",
-                            retryable=company_page is not None,
-                        )
-                        if (action or "").strip().lower() == "reset":
-                            raise _ResetRequested()
-                        if company_page is not None and (action or "").strip().lower() == "retry":
-                            log(f"[{i}] Retrying autofill on the same page...")
-                            continue
-
-                    break
+                company_page = await _fill_review_retry_loop(
+                    page, company_page, known_pages, current_page, job_id, i,
+                    profile, max_steps, confirm_or_reset, ask_fn, on_frame, log,
+                )
 
                 if applying_current_page:
                     # page itself is what just got filled -- no jobright job
@@ -609,6 +690,8 @@ async def run_automation(
                     current_page["page"] = page
                     await page.go_back()
                     await page.wait_for_selector("h2.index_job-title__Riiip", timeout=20000)
+            except _StopRequested:
+                break
             except _ResetRequested:
                 log(f"[{i}] Resetting back to the internship listing page...")
                 current_page["page"] = page

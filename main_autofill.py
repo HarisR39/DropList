@@ -56,6 +56,12 @@ class FakePage:
         self.wait_for_timeout = AsyncMock()
         self.keyboard = MagicMock()
         self.keyboard.press = AsyncMock()
+        # Just itself by default -- e.g. _follow_new_tab_if_opened's
+        # pages-before/pages-after diff then correctly sees no new tab.
+        # Tests exercising an Apply/Next click that opens a new tab append
+        # a second FakePage here instead.
+        self.context = MagicMock()
+        self.context.pages = [self]
 
     def locator(self, selector: str) -> FakeLocator:
         if selector not in self._selector_locators:
@@ -760,7 +766,7 @@ async def test_capture_frame_calls_on_frame_with_screenshot_bytes(tmp_path):
 
     await autofill._capture_frame(page, None, "form", 0, "before", frames.append)
 
-    page.screenshot.assert_awaited_once_with(type="jpeg", quality=60, full_page=True)
+    page.screenshot.assert_awaited_once_with(type="jpeg", quality=60, full_page=True, timeout=5000)
     assert frames == [b"fake-jpeg-bytes"]
 
 
@@ -795,8 +801,8 @@ async def test_take_frame_screenshot_falls_back_to_viewport_when_full_page_fails
 
     assert result == b"viewport-bytes"
     assert page.screenshot.await_args_list == [
-        call(type="jpeg", quality=60, full_page=True),
-        call(type="jpeg", quality=60),
+        call(type="jpeg", quality=60, full_page=True, timeout=5000),
+        call(type="jpeg", quality=60, timeout=5000),
     ]
 
 
@@ -1036,6 +1042,54 @@ async def test_multistep_clicks_entry_button_then_fills_form(monkeypatch):
     entry_button.click.assert_awaited_once()
     autofill_form_mock.assert_awaited_once()
     assert result.filled == ["Name"]
+
+
+async def test_multistep_follows_new_tab_opened_by_entry_button_click(monkeypatch):
+    # Regression: some ATS platforms (seen on Greenhouse) open the real
+    # application in a brand new tab when Apply is clicked, rather than
+    # navigating the same page in place. Continuing to operate on the old,
+    # now-abandoned tab would mean autofill never actually reaches the real
+    # form -- and the caller (main.run_automation) would go on to
+    # misidentify the new tab as an unrecognized login popup.
+    entry_button = MagicMock()
+
+    page = FakePage()
+    new_page = FakePage(url="https://example-ats.com/apply/real-form")
+
+    def _open_new_tab_on_click(*args, **kwargs):
+        page.context.pages.append(new_page)
+
+    entry_button.click = AsyncMock(side_effect=_open_new_tab_on_click)
+
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(side_effect=[entry_button, None]))
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=SOME_FIELDS))
+    autofill_form_mock = AsyncMock(return_value=AutofillResult(filled=["Name"], needs_review=[], errors=[]))
+    monkeypatch.setattr(autofill, "autofill_form", autofill_form_mock)
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    assert result.final_page is new_page
+    # The fill that followed the entry-button click happened on the new
+    # tab, not the old, abandoned one.
+    assert autofill_form_mock.await_args.args[0] is new_page
+
+
+async def test_multistep_final_page_is_none_when_never_switched(monkeypatch):
+    # No new tab ever opened -- final_page should stay None so a caller's
+    # "did the page change" check is a cheap, correct no-op.
+    fields = [FormField("f0", "Some Field", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        autofill, "autofill_form", AsyncMock(return_value=AutofillResult(filled=["Some Field"], needs_review=[], errors=[]))
+    )
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+
+    page = FakePage()
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", max_steps=6)
+
+    assert result.final_page is None
 
 
 async def test_multistep_gives_up_when_no_fields_and_no_entry_button(monkeypatch):
