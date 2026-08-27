@@ -34,13 +34,23 @@ import mapping_cache
 LLM_PROVIDER = os.environ.get("AUTOFILL_LLM_PROVIDER", "ollama")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 ANTHROPIC_MODEL = "claude-sonnet-5"
+# Local vision model used only as a last-resort fallback (see
+# _vision_find_apply_button_text) when a page has no fillable fields AND no
+# Apply-style button was found via the normal accessibility-tree search --
+# some ATS platforms render their Apply control as something Playwright's
+# role-based query can't see (a styled <div>, a custom web component, etc.)
+# even though it's plainly visible on screen.
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
+VISION_TIMEOUT_SECONDS = int(os.environ.get("AUTOFILL_VISION_TIMEOUT", "60"))
+# Applies per batch (see MAPPING_BATCH_SIZE), not to the form as a whole --
+# fields are mapped and filled one batch at a time, so a slow/stuck batch
+# only costs its own fields, not the whole form's progress.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("AUTOFILL_LLM_TIMEOUT", "150"))
 # Local models lose track of the exact JSON schema and start dropping/misnaming
 # keys on very large forms (seen: 87 fields on a Lever form producing valid
 # JSON that was missing the "mappings" wrapper entirely). Batching keeps each
 # call small enough to be reliable.
 MAPPING_BATCH_SIZE = int(os.environ.get("AUTOFILL_MAPPING_BATCH_SIZE", "12"))
-PER_BATCH_TIMEOUT_SECONDS = 45
 
 _anthropic_client = None
 
@@ -62,6 +72,31 @@ ENTRY_BUTTON_NAMES = ["Apply Now", "Apply for this Job", "Apply for this positio
 # "Apply for Software Engineering Intern" -- requires a word after "Apply" so
 # it still excludes a bare "Apply" pill and "Quick Apply with MyGreenhouse".
 GENERIC_APPLY_BUTTON_PATTERN = re.compile(r"^apply\b.+", re.IGNORECASE)
+
+# "Apply with LinkedIn"/"Apply with GitHub"/etc. matches GENERIC_APPLY_BUTTON_
+# PATTERN just as readily as "Apply for Software Engineer" does -- these are
+# OAuth-style shortcuts this automation can't and shouldn't complete on your
+# behalf (it would mean logging into your LinkedIn/GitHub/etc. account), so
+# they're always skipped in favor of the site's own manual application path,
+# even when one would otherwise match first in DOM order. "Resume"/"CV" is
+# grouped in here too for a different reason: some ATS platforms (e.g.
+# Oracle Recruiting Cloud) offer an "Apply with Resume" shortcut that
+# auto-parses an uploaded resume into the whole application instead of
+# leaving the real form fields in place -- skipping it in favor of the
+# manual path means the resume still gets attached (via the real file-
+# upload field autofill_form already handles), but every other field goes
+# through this module's own field-by-field mapping instead of the ATS's own
+# unpredictable resume parser.
+THIRD_PARTY_APPLY_KEYWORDS = [
+    "linkedin", "github", "indeed", "google", "facebook", "twitter",
+    "apple", "seek", "ziprecruiter", "monster", "glassdoor",
+    "resume", "cv",
+]
+
+
+def _is_third_party_apply_option(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(keyword in lowered for keyword in THIRD_PARTY_APPLY_KEYWORDS)
 
 COOKIE_BANNER_SELECTORS = ["#onetrust-accept-btn-handler"]
 COOKIE_BANNER_BUTTON_NAMES = [
@@ -105,6 +140,11 @@ Rules:
   it out as the word "Yes" or "No" in "value" — never the literal string "true"/"false",
   since real form options are worded that way, not as JSON booleans.
 - Keep generated free-text answers under 100 words unless the field specifies a length.
+- A profile's "first_name"/"last_name" are the candidate's legal name — use these for any
+  field labeled "First Name"/"Last Name"/"Full Name"/"Legal Name". Only use "preferred_name"
+  for a field that explicitly asks for a preferred name, nickname, chosen name, or "name you
+  go by" — never substitute it for a plain "First Name" field just because it's shorter or
+  more casual.
 
 Respond with ONLY valid JSON matching this schema, no preamble or markdown:
 {
@@ -134,6 +174,18 @@ class AutofillResult:
     filled: list[str]
     needs_review: list[dict[str, Any]]
     errors: list[dict[str, Any]]
+    login_required: bool = False
+    # Only ever set by autofill_form_multistep, to the page it actually
+    # ended up operating on -- an Apply/Next click can open the real next
+    # step in a new tab rather than navigating in place (seen on some
+    # Greenhouse listings), and autofill_form_multistep follows that new
+    # tab internally. Compare against whatever page you passed in: if it
+    # differs, callers that track the page across calls (main.run_
+    # automation's company_page/known_pages) need to switch to it too, or
+    # they'll keep looking at the original, now-abandoned tab -- which also
+    # makes the real one look like an unrecognized extra page (see
+    # main._find_login_popup).
+    final_page: Any = None
 
 
 async def extract_fields(page: Page) -> list[FormField]:
@@ -351,16 +403,39 @@ def _call_anthropic(user_content: str) -> str:
     return message.content[0].text
 
 
-def _call_ollama(user_content: str) -> str:
+def _call_ollama(user_content: str, num_predict: int = 4096) -> str:
     import ollama
     response = ollama.chat(
         model=OLLAMA_MODEL,
         format="json",
-        options={"num_predict": 4096},
+        options={"num_predict": num_predict},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
+    )
+    return response["message"]["content"]
+
+
+APPLY_VISION_PROMPT = (
+    "You are looking at a screenshot of a job application webpage. Is there a "
+    "button or link visible whose purpose is to start or begin a job "
+    "application -- for example labeled something like \"Apply\", \"Apply Now\", "
+    "\"Apply for this Job\", \"Start Application\", or similar? "
+    "Do NOT pick a button that imports/autofills the application from a "
+    "third-party account or a resume upload, such as \"Apply with LinkedIn\", "
+    "\"Apply with Indeed\", \"Apply with Google\", or \"Apply with Resume\"/\"CV\" -- "
+    "only a plain, direct apply button counts. "
+    "If yes, reply with ONLY its exact visible text and nothing else. "
+    "If there is no such button or link visible, reply with exactly: NONE"
+)
+
+
+def _call_ollama_vision(image_bytes: bytes, prompt: str) -> str:
+    import ollama
+    response = ollama.chat(
+        model=OLLAMA_VISION_MODEL,
+        messages=[{"role": "user", "content": prompt, "images": [image_bytes]}],
     )
     return response["message"]["content"]
 
@@ -376,7 +451,19 @@ def get_mappings(fields: list[FormField], profile: dict[str, Any]) -> list[dict[
         "Map each field to a value per the rules above."
     )
 
-    text = _call_ollama(user_content) if LLM_PROVIDER == "ollama" else _call_anthropic(user_content)
+    if LLM_PROVIDER == "ollama":
+        # A fixed 4096-token ceiling measurably slows local CPU inference on
+        # small batches -- the model keeps "room" to ramble before settling
+        # into the JSON even when the actual answer is short. Scaling the
+        # cap to the batch size (~220 tokens/field covers a value + short
+        # reasoning sentence each, from observed output) cuts real latency
+        # without truncating legitimate output -- worst case a batch that
+        # somehow needs more just runs out and fails json.loads() below,
+        # which is already handled like any other malformed-response failure.
+        num_predict = min(4096, max(800, len(fields) * 220 + 300))
+        text = _call_ollama(user_content, num_predict=num_predict)
+    else:
+        text = _call_anthropic(user_content)
     text = text.strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     parsed = json.loads(text)
@@ -385,41 +472,6 @@ def get_mappings(fields: list[FormField], profile: dict[str, Any]) -> list[dict[
         # instruction-following strain and return the bare array instead.
         return parsed
     return parsed["mappings"]
-
-
-def get_mappings_cached(fields: list[FormField], profile: dict[str, Any], domain: str) -> list[dict[str, Any]]:
-    """Same as get_mappings, but (a) splits large field lists into smaller
-    batches -- local models start dropping/misnaming JSON keys on very large
-    forms (seen: an 87-field Lever form producing valid JSON missing the
-    "mappings" key entirely) -- and (b) caches (and can fail) per batch, so
-    one bad batch doesn't lose mappings the rest of the form already got
-    right, and a retry doesn't have to redo batches that already succeeded."""
-    all_mappings: list[dict[str, Any]] = []
-    batches = [fields[i:i + MAPPING_BATCH_SIZE] for i in range(0, len(fields), MAPPING_BATCH_SIZE)]
-
-    for batch_num, batch in enumerate(batches, start=1):
-        field_hash = mapping_cache.hash_fields(batch)
-        cached = mapping_cache.get(domain, field_hash)
-        if cached is not None:
-            all_mappings.extend(cached)
-            continue
-
-        if len(batches) > 1:
-            print(f"  Batch {batch_num}/{len(batches)} ({len(batch)} field(s))...")
-        try:
-            batch_mappings = get_mappings(batch, profile)
-        except Exception as e:
-            print(f"  Batch {batch_num}/{len(batches)} failed ({e}); flagging its fields for manual review.")
-            batch_mappings = [
-                {"field_id": f.field_id, "value": None, "needs_review": True,
-                 "reasoning": "LLM mapping call failed or returned malformed JSON for this batch"}
-                for f in batch
-            ]
-        else:
-            mapping_cache.store(domain, field_hash, batch_mappings)
-        all_mappings.extend(batch_mappings)
-
-    return all_mappings
 
 
 def _best_word_overlap_index(value: str, option_texts: list[str]) -> int | None:
@@ -539,7 +591,8 @@ def _needs_review_entry(f: FormField, reasoning: str) -> dict[str, Any]:
 
 
 async def apply_mapping(
-    page: Page, fields: list[FormField], mappings: list[dict[str, Any]], resume_path: str, cover_letter_path: str | None
+    page: Page, fields: list[FormField], mappings: list[dict[str, Any]], resume_path: str, cover_letter_path: str | None,
+    on_frame: Any = None,
 ) -> AutofillResult:
     field_by_id = {f.field_id: f for f in fields}
     filled, needs_review, errors = [], [], []
@@ -626,10 +679,49 @@ async def apply_mapping(
             else:
                 await page.locator(f.selector).fill(str(value))
             filled.append(f.label)
+            if on_frame is not None:
+                # Capture right after this field's own visible change, not
+                # just before/after the whole batch -- so the live view
+                # tracks along as the form fills in field by field instead
+                # of jumping straight from empty to fully filled.
+                frame_bytes = await take_frame_screenshot(page)
+                if frame_bytes is not None:
+                    on_frame(frame_bytes)
         except Exception as e:
             errors.append({"label": f.label, "error": str(e)})
 
     return AutofillResult(filled=filled, needs_review=needs_review, errors=errors)
+
+
+LOGIN_GATE_MAX_FIELDS = 4
+LOGIN_GATE_PHRASES = [
+    "welcome back", "already have an account", "forgot your password",
+    "forgot password", "sign in to your account", "log in to your account",
+]
+
+
+async def _looks_like_login_gate(page: Page, fields: list[FormField]) -> bool:
+    """Best-effort signal that this page is asking you to log into an
+    EXISTING account, rather than showing the real application form or a
+    normal new-account signup step. There's no reliable site-agnostic way
+    to tell these apart with certainty, so this only fires on a strong
+    pairing of two signals: a small password-bearing form (a real
+    application legitimately has a password field too sometimes, for new
+    account creation, but always alongside plenty of other real fields --
+    name, resume, etc.) AND clear "returning user" phrasing nearby (plain
+    account-creation forms don't say "welcome back" or "forgot your
+    password"). Without the phrasing, this falls back to the existing
+    account-signup handling (_account_signup_mappings) instead of stopping.
+    A false positive here just means pausing for a human a bit early,
+    never a wrong auto-fill or auto-submit."""
+    if not fields or len(fields) > LOGIN_GATE_MAX_FIELDS:
+        return False
+    if not any(f.type == "password" for f in fields):
+        return False
+    for phrase in LOGIN_GATE_PHRASES:
+        if await page.get_by_text(phrase, exact=False).count() > 0:
+            return True
+    return False
 
 
 def _account_signup_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
@@ -671,6 +763,68 @@ def _account_signup_mappings(fields: list[FormField], profile: dict[str, Any]) -
     return mappings, handled_ids
 
 
+BOILERPLATE_CONSENT_PATTERNS = [
+    "terms and conditions", "terms of service", "terms of use",
+    "privacy policy", "privacy notice", "privacy statement",
+    "code of conduct", "data protection policy",
+]
+
+
+def _is_boilerplate_consent_checkbox(label: str) -> bool:
+    lowered = label.strip().lower()
+    return any(pattern in lowered for pattern in BOILERPLATE_CONSENT_PATTERNS)
+
+
+def _consent_checkbox_mappings(fields: list[FormField]) -> tuple[list[dict[str, Any]], set[str]]:
+    """Deterministically check boilerplate agree-to-terms/privacy-policy
+    checkboxes -- unlike an EEO/eligibility checkbox, agreeing to the site's
+    terms carries no factual claim about the candidate, so there's nothing
+    for a human to actually decide here. Handled directly instead of risking
+    an LLM refusal or a needs_review pause on every single application."""
+    mappings = []
+    handled_ids = set()
+    for f in fields:
+        if f.type == "checkbox" and _is_boilerplate_consent_checkbox(f.label):
+            mappings.append({
+                "field_id": f.field_id,
+                "value": "Yes",
+                "needs_review": False,
+                "reasoning": "boilerplate terms/privacy-policy consent required to proceed",
+            })
+            handled_ids.add(f.field_id)
+    return mappings, handled_ids
+
+
+SECOND_ADDRESS_LABEL_PATTERNS = ["address line 2", "address 2", "address line two"]
+# \b word-boundary matches, not bare substrings -- "unit" as a plain
+# substring also matches inside "opportunity" ("opport-UNIT-y"), which
+# wrongly swallowed unrelated fields like "How did you hear about this
+# opportunity?" before this was word-boundary-anchored.
+SECOND_ADDRESS_LABEL_KEYWORD_PATTERN = re.compile(r"\b(apt|apartment|suite|unit)\b", re.IGNORECASE)
+
+
+def _is_second_address_field(label: str) -> bool:
+    lowered = label.strip().lower()
+    if any(pattern in lowered for pattern in SECOND_ADDRESS_LABEL_PATTERNS):
+        return True
+    # Covers "Apt/Suite/Unit", "Apartment, suite, etc.", "Unit #", and
+    # similar -- a job application has no other realistic reason to ask
+    # about an apartment/suite/unit, so a bare keyword match is safe here.
+    return SECOND_ADDRESS_LABEL_KEYWORD_PATTERN.search(lowered) is not None
+
+
+def _ignored_field_ids(fields: list[FormField]) -> set[str]:
+    """Field ids to skip entirely -- never filled, never flagged for manual
+    review, never even shown to the LLM. Currently just the near-universal
+    optional "Address Line 2"/"Apt/Suite/Unit" field: per explicit user
+    preference, this automation doesn't bother with a second address line at
+    all, and silently skipping it (rather than leaving it null+needs_review)
+    avoids cluttering every single application's review list with a field
+    that's essentially always optional and never actually needs a human
+    decision."""
+    return {f.field_id for f in fields if _is_second_address_field(f.label)}
+
+
 def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
     """Reuse answers the user was previously asked for (profile['custom_answers'],
     keyed by lowercased field label) instead of asking again or re-flagging them."""
@@ -693,68 +847,231 @@ def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) ->
     return mappings, handled_ids
 
 
+# Plain contact/bio fields, matched by label -- straight lookups against
+# profile keys with no judgment involved (unlike EEO/eligibility Yes-No
+# questions, open-ended essays, or arbitrary dropdown option matching,
+# which all still need the LLM's actual language understanding and stay
+# out of this list on purpose -- see SYSTEM_PROMPT's own rules on those).
+# Order matters: first pattern to match wins, so more specific patterns
+# (e.g. "preferred name") are listed before more general ones they'd
+# otherwise be swallowed by.
+PROFILE_FIELD_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bpreferred\s*name\b|\bnickname\b|\bname\s+you\s+go\s+by\b|\bchosen\s*name\b", re.I), "preferred_name"),
+    (re.compile(r"\bfirst\s*name\b|\bgiven\s*name\b", re.I), "first_name"),
+    (re.compile(r"\blast\s*name\b|\bsurname\b|\bfamily\s*name\b", re.I), "last_name"),
+    (re.compile(r"\be[- ]?mail\b", re.I), "email"),
+    (re.compile(r"\bphone\b|\bmobile\b|\btelephone\b", re.I), "phone"),
+    (re.compile(r"\blinkedin\b", re.I), "linkedin_url"),
+    (re.compile(r"\bportfolio\b|\bpersonal\s*website\b|\bwebsite\b", re.I), "portfolio_url"),
+    (re.compile(r"\bschool\b|\buniversity\b|\bcollege\b", re.I), "school"),
+    (re.compile(r"\bdegree\b", re.I), "degree"),
+    (re.compile(r"\bfield\s*of\s*study\b|\bmajor\b", re.I), "field_of_study"),
+    (re.compile(r"\bcountry\b", re.I), "country"),
+]
+# "Phone Country Code" / "Dial Code" / "Area Code" ask for a short numeric
+# code, not the candidate's full phone number or country name -- must be
+# excluded up front, before "phone" or "country" above gets a chance to
+# match ("phone" comes first in the list and would otherwise win outright).
+_CODE_FIELD_EXCLUSION_PATTERN = re.compile(
+    r"\bcode\b.*\b(country|dial|area|phone)\b|\b(country|dial|area|phone)\b.*\bcode\b", re.I
+)
+# A label mentioning any of these isn't asking about the candidate at all
+# (an emergency contact, a professional reference, etc.) -- a bare "First
+# Name"/"Phone" match on one of those would wrongly fill someone else's
+# info with the candidate's own.
+PROFILE_FIELD_DISQUALIFYING_KEYWORDS = [
+    "reference", "emergency", "spouse", "supervisor", "manager", "employer",
+    "coworker", "colleague",
+]
+
+
+def _match_profile_field_key(label: str) -> str | None:
+    lowered = label.strip().lower()
+    if any(word in lowered for word in PROFILE_FIELD_DISQUALIFYING_KEYWORDS):
+        return None
+    if _CODE_FIELD_EXCLUSION_PATTERN.search(lowered):
+        return None
+    for pattern, key in PROFILE_FIELD_PATTERNS:
+        if pattern.search(lowered):
+            return key
+    return None
+
+
+def _profile_field_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+    """Deterministically fill plain single-value contact/bio fields (name,
+    email, phone, links, school, degree, field of study, country) straight
+    from the profile -- these need only a label match, not any actual
+    judgment, so there's no reason to spend an LLM call on them. Restricted
+    to simple text-ish input types on purpose: a select/combobox/radio
+    still needs real option matching, and a textarea's length usually
+    signals it wants more than a bare profile value dropped in verbatim."""
+    mappings = []
+    handled_ids = set()
+    for f in fields:
+        if f.type not in ("text", "email", "tel", "url"):
+            continue
+        key = _match_profile_field_key(f.label)
+        if key is None:
+            continue
+        value = profile.get(key)
+        if not value:
+            # Nothing confident to fill -- leave it in the batch so the LLM
+            # still gets a chance (e.g. it might derive a value this plain
+            # lookup can't), rather than silently giving up on it here.
+            continue
+        mappings.append({
+            "field_id": f.field_id,
+            "value": value,
+            "needs_review": False,
+            "reasoning": f"direct match from profile['{key}']",
+        })
+        handled_ids.add(f.field_id)
+    return mappings, handled_ids
+
+
 async def autofill_form(
     page: Page,
     profile: dict[str, Any],
     resume_path: str,
     cover_letter_path: str | None = None,
     fields: list[FormField] | None = None,
+    log: Any = print,
+    on_frame: Any = None,
 ) -> AutofillResult:
     if fields is None:
         fields = await extract_fields(page)
     if not fields:
         return AutofillResult(filled=[], needs_review=[], errors=[])
 
+    ignored_ids = _ignored_field_ids(fields)
+    if ignored_ids:
+        fields = [f for f in fields if f.field_id not in ignored_ids]
+    if not fields:
+        return AutofillResult(filled=[], needs_review=[], errors=[])
+
     account_mappings, account_handled_ids = _account_signup_mappings(fields, profile)
     custom_mappings, custom_handled_ids = _custom_answer_mappings(fields, profile)
-    handled_ids = account_handled_ids | custom_handled_ids
+    consent_mappings, consent_handled_ids = _consent_checkbox_mappings(fields)
+    already_handled_ids = account_handled_ids | custom_handled_ids | consent_handled_ids
+    # Only offered fields the earlier layers didn't already claim, so e.g. a
+    # remembered custom answer for "Email" still wins over the plain profile
+    # lookup instead of the two colliding on the same field.
+    profile_mappings, profile_handled_ids = _profile_field_mappings(
+        [f for f in fields if f.field_id not in already_handled_ids], profile
+    )
+    handled_ids = already_handled_ids | profile_handled_ids
+    handled_fields = [f for f in fields if f.field_id in handled_ids]
     remaining = [f for f in fields if f.field_id not in handled_ids]
 
-    mappings = account_mappings + custom_mappings
+    # Deterministic fields (account signup, remembered custom answers,
+    # boilerplate consent checkboxes, plain profile lookups) need no LLM
+    # call, so fill those in right away rather than waiting on whatever
+    # comes next.
+    result = await apply_mapping(
+        page, handled_fields,
+        account_mappings + custom_mappings + consent_mappings + profile_mappings,
+        resume_path, cover_letter_path, on_frame=on_frame,
+    )
+
     if remaining:
         domain = urlparse(page.url).netloc
-        mappings.extend(await _get_mappings_with_timeout(remaining, profile, domain))
-
-    return await apply_mapping(page, fields, mappings, resume_path, cover_letter_path)
-
-
-async def _get_mappings_with_timeout(
-    fields: list[FormField], profile: dict[str, Any], domain: str
-) -> list[dict[str, Any]]:
-    """Run the (blocking) LLM mapping call off the event loop, print progress
-    so a slow local model doesn't look like a hang, and give up gracefully
-    (flagging for manual review) instead of blocking forever."""
-    num_batches = max(1, -(-len(fields) // MAPPING_BATCH_SIZE))  # ceil div
-    timeout = max(LLM_TIMEOUT_SECONDS, num_batches * PER_BATCH_TIMEOUT_SECONDS)
-    print(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
-          f"({num_batches} batch(es))...")
-    start = time.time()
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(get_mappings_cached, fields, profile, domain),
-            timeout=timeout,
+        batch_result = await _map_and_apply_in_batches(
+            page, remaining, profile, domain, resume_path, cover_letter_path, log, on_frame=on_frame
         )
-        print(f"  Got mappings in {time.time() - start:.1f}s.")
-        return result
-    except asyncio.TimeoutError:
-        print(f"  Timed out after {timeout}s waiting for {LLM_PROVIDER}; "
-              f"flagging these fields for manual review.")
-    except Exception as e:
-        print(f"  Mapping call failed ({e}); flagging these fields for manual review.")
+        result = AutofillResult(
+            filled=result.filled + batch_result.filled,
+            needs_review=result.needs_review + batch_result.needs_review,
+            errors=result.errors + batch_result.errors,
+        )
 
-    return [
-        {"field_id": f.field_id, "value": None, "needs_review": True, "reasoning": "LLM mapping call failed or timed out"}
-        for f in fields
-    ]
+    return result
+
+
+async def _map_and_apply_in_batches(
+    page: Page,
+    fields: list[FormField],
+    profile: dict[str, Any],
+    domain: str,
+    resume_path: str,
+    cover_letter_path: str | None,
+    log: Any = print,
+    on_frame: Any = None,
+) -> AutofillResult:
+    """Map and fill one batch of fields at a time, instead of mapping the
+    whole form before filling anything. If a later batch's LLM call times out
+    or fails, everything already mapped and filled from earlier batches stays
+    filled -- only the batch that's actually stuck loses its own fields to
+    manual review, not the whole form's progress. Also means the form fills
+    in progressively (visible in a live view) rather than all at once at the
+    end. Caches (and can fail) per batch too, same as before, so a retry
+    doesn't have to redo batches that already succeeded.
+
+    log(), if given, replaces plain print() for progress/failure messages --
+    see main.run_automation's docstring."""
+    all_filled: list[str] = []
+    all_needs_review: list[dict[str, Any]] = []
+    all_errors: list[dict[str, Any]] = []
+
+    batches = [fields[i:i + MAPPING_BATCH_SIZE] for i in range(0, len(fields), MAPPING_BATCH_SIZE)]
+    num_batches = len(batches)
+    if num_batches > 1:
+        log(f"  Asking {LLM_PROVIDER} to map {len(fields)} field(s) on {domain} "
+            f"({num_batches} batch(es))...")
+
+    for batch_num, batch in enumerate(batches, start=1):
+        field_hash = mapping_cache.hash_fields(batch)
+        cached = mapping_cache.get(domain, field_hash)
+        if cached is not None:
+            batch_mappings = cached
+        else:
+            if num_batches > 1:
+                log(f"  Batch {batch_num}/{num_batches} ({len(batch)} field(s))...")
+            start = time.time()
+            try:
+                batch_mappings = await asyncio.wait_for(
+                    asyncio.to_thread(get_mappings, batch, profile),
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
+                log(f"  Batch {batch_num}/{num_batches} mapped in {time.time() - start:.1f}s.")
+                mapping_cache.store(domain, field_hash, batch_mappings)
+            except asyncio.TimeoutError:
+                log(f"  Batch {batch_num}/{num_batches} timed out after {LLM_TIMEOUT_SECONDS}s "
+                    f"waiting for {LLM_PROVIDER}; flagging its fields for manual review.")
+                batch_mappings = [
+                    {"field_id": f.field_id, "value": None, "needs_review": True,
+                     "reasoning": "LLM mapping call timed out for this batch"}
+                    for f in batch
+                ]
+            except Exception as e:
+                log(f"  Batch {batch_num}/{num_batches} failed ({e}); flagging its fields for manual review.")
+                batch_mappings = [
+                    {"field_id": f.field_id, "value": None, "needs_review": True,
+                     "reasoning": f"LLM mapping call failed or returned malformed JSON for this batch ({e})"}
+                    for f in batch
+                ]
+
+        batch_result = await apply_mapping(page, batch, batch_mappings, resume_path, cover_letter_path, on_frame=on_frame)
+        all_filled.extend(batch_result.filled)
+        all_needs_review.extend(batch_result.needs_review)
+        all_errors.extend(batch_result.errors)
+
+    return AutofillResult(filled=all_filled, needs_review=all_needs_review, errors=all_errors)
 
 
 async def find_button_by_names(page: Page, names: list[str]):
-    """Return a locator for the first button/link matching any of the given names, or None."""
+    """Return a locator for the first button/link matching any of the given
+    names, or None. Skips OAuth-style "Apply with <provider>" shortcuts
+    (LinkedIn, GitHub, Indeed, etc.) even if one would otherwise match
+    first in DOM order -- see _is_third_party_apply_option."""
     for name in names:
         for role in ("button", "link"):
             locator = page.get_by_role(role, name=name, exact=False)
-            if await locator.count() > 0:
-                return locator.first
+            count = await locator.count()
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                text = await candidate.inner_text()
+                if not _is_third_party_apply_option(text):
+                    return candidate
     return None
 
 
@@ -783,10 +1100,17 @@ async def find_entry_button(page: Page, allow_bare_apply: bool = False):
     # "Apply" followed by more text -- this still excludes a bare "Apply" pill
     # (e.g. a scroll-to-form shortcut) and unrelated "Quick Apply ..." controls
     # that don't start with the word, both of which caused real problems before.
+    # Also skips "Apply with LinkedIn/GitHub/etc." (see _is_third_party_apply_option) --
+    # this pattern would otherwise match those just as readily as a real
+    # "Apply for <Job Title>" button.
     for role in ("button", "link"):
         locator = page.get_by_role(role, name=GENERIC_APPLY_BUTTON_PATTERN)
-        if await locator.count() > 0:
-            return locator.first
+        count = await locator.count()
+        for idx in range(count):
+            candidate = locator.nth(idx)
+            text = await candidate.inner_text()
+            if not _is_third_party_apply_option(text):
+                return candidate
 
     if allow_bare_apply:
         for role in ("button", "link"):
@@ -794,6 +1118,32 @@ async def find_entry_button(page: Page, allow_bare_apply: bool = False):
             if await locator.count() > 0:
                 return locator.first
     return None
+
+
+async def _only_third_party_apply_available(page: Page) -> bool:
+    """True if the only apply-style buttons/links on the page are OAuth
+    shortcuts (Apply with LinkedIn/GitHub/etc.) with no manual/direct option
+    at all -- there's nothing safe for this automation to click in that
+    case, as opposed to find_entry_button returning None because the page
+    simply has no apply button yet (e.g. the real form is already showing)."""
+    found_any = False
+    for role in ("button", "link"):
+        for name in ENTRY_BUTTON_NAMES:
+            locator = page.get_by_role(role, name=name, exact=False)
+            count = await locator.count()
+            for idx in range(count):
+                found_any = True
+                text = await locator.nth(idx).inner_text()
+                if not _is_third_party_apply_option(text):
+                    return False
+        locator = page.get_by_role(role, name=GENERIC_APPLY_BUTTON_PATTERN)
+        count = await locator.count()
+        for idx in range(count):
+            found_any = True
+            text = await locator.nth(idx).inner_text()
+            if not _is_third_party_apply_option(text):
+                return False
+    return found_any
 
 
 async def dismiss_cookie_banner(page: Page) -> bool:
@@ -822,25 +1172,143 @@ async def dismiss_cookie_banner(page: Page) -> bool:
     return False
 
 
+async def _vision_find_apply_button_text(page: Page) -> str | None:
+    """Last-resort fallback for when a page has no fillable fields AND
+    find_entry_button's accessibility-tree search came up empty -- some ATS
+    platforms render their Apply control as something Playwright's
+    role-based query can't see (a styled <div>, a custom web component,
+    etc.) even though it's plainly visible on screen. Asks a local vision
+    model to read a screenshot directly and report the button's visible
+    text; returns None (rather than raising) on any failure, since this is
+    only ever a fallback on top of the normal DOM-based search, never the
+    primary path. Never clicks anything itself or acts on guessed pixel
+    coordinates -- the caller still has to find a real Playwright locator
+    matching the reported text (see _click_by_visible_text)."""
+    try:
+        screenshot = await page.screenshot(type="jpeg", quality=70)
+    except Exception:
+        return None
+    if not screenshot:
+        return None
+
+    try:
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(_call_ollama_vision, screenshot, APPLY_VISION_PROMPT),
+            timeout=VISION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+
+    answer = answer.strip().strip('"').strip("'")
+    if not answer or answer.upper().startswith("NONE"):
+        return None
+    if _is_third_party_apply_option(answer):
+        # Defense in depth on top of the prompt's own instruction above --
+        # a local vision model isn't perfectly instruction-following, and a
+        # large, colorful "Apply with LinkedIn/Indeed/Resume" button is
+        # exactly the kind of thing it'll misidentify as *the* apply button,
+        # especially when the real form fields are smaller or out of frame.
+        return None
+    return answer
+
+
+async def _click_by_visible_text(page: Page, text: str, timeout: int = 5000) -> bool:
+    """Click the first visible element matching this text -- broader than
+    find_entry_button's strict name-list/pattern matching, since this is
+    only ever used for text a vision model already confirmed is a real,
+    on-screen Apply-style control (see _vision_find_apply_button_text), not
+    for guessing at arbitrary page text."""
+    for role in ("button", "link"):
+        locator = page.get_by_role(role, name=text, exact=False)
+        if await locator.count() > 0:
+            try:
+                await locator.first.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+    locator = page.get_by_text(text, exact=False)
+    if await locator.count() > 0:
+        try:
+            await locator.first.click(timeout=timeout)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+async def _peek_combobox_options(page: Page, selector: str) -> list[str]:
+    """Open a combobox and read whatever options are already rendered,
+    without typing or selecting anything -- a starting list to show a human
+    reviewer instead of a blank text box. Search-driven widgets (city,
+    school, country) render nothing until you type, so an empty result here
+    is expected and not itself a problem; short static lists (EEO-style
+    Yes/No/Decline questions) render everything immediately and this picks
+    those up. Best-effort -- any failure here just means no options shown,
+    never a reason to fail the review prompt itself.
+
+    Presses Escape afterward to close the widget back up -- select_combobox_
+    option() does its own click-to-open when the answer actually comes in,
+    and leaving this one open first could make that second click toggle it
+    closed instead, on widgets where the control is a click-to-toggle button
+    rather than a plain focus-to-open input."""
+    try:
+        await page.locator(selector).click(timeout=3000)
+        everything = page.get_by_role("option")
+        try:
+            await everything.first.wait_for(timeout=1500)
+        except Exception:
+            pass
+        texts = await everything.all_inner_texts()
+    except Exception:
+        return []
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return texts
+
+
 async def _resolve_needs_review_interactively(
-    page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]]
+    page: Page, profile: dict[str, Any], needs_review: list[dict[str, Any]],
+    ask_fn: Any = None,
+    on_frame: Any = None,
 ) -> list[dict[str, Any]]:
     """Ask the user for anything Claude couldn't confidently answer, right while
     those fields are still live on the page, fill in whatever they provide, and
     remember it in profile['custom_answers'] so the same question on a future
-    application is answered automatically instead of asked again."""
+    application is answered automatically instead of asked again.
+
+    ask_fn, if given, is a synchronous callable(item_dict) -> str used instead
+    of the terminal print()/input() below -- e.g. a GUI-backed prompt that
+    blocks the calling thread until the user answers. It receives the same
+    item dict (label/reasoning/options/type/...) so the caller can render it
+    however it likes; an empty/blank return means "skip", same as pressing
+    Enter at the terminal prompt.
+
+    on_frame, if given, is a synchronous callable(jpeg_bytes) called with a
+    fresh screenshot right before each item is presented -- e.g. to update a
+    live view of the page the user is being asked about."""
     still_needs_review = []
     custom_answers = profile.setdefault("custom_answers", {})
 
     for item in needs_review:
         label = item["label"]
-        print(f"\nNeeds your input -- \"{label}\"")
-        if item.get("reasoning"):
-            print(f"  (reason: {item['reasoning']})")
-        if item.get("options"):
-            print(f"  Options: {', '.join(item['options'])}")
+        if item.get("type") == "combobox" and item.get("selector") and not item.get("options"):
+            item["options"] = await _peek_combobox_options(page, item["selector"])
+        if on_frame is not None:
+            frame_bytes = await take_frame_screenshot(page)
+            if frame_bytes is not None:
+                on_frame(frame_bytes)
+        if ask_fn is not None:
+            answer = (ask_fn(item) or "").strip()
+        else:
+            print(f"\nNeeds your input -- \"{label}\"")
+            if item.get("reasoning"):
+                print(f"  (reason: {item['reasoning']})")
+            if item.get("options"):
+                print(f"  Options: {', '.join(item['options'])}")
+            answer = input("  Enter a value (or press Enter to skip / leave for manual review): ").strip()
 
-        answer = input("  Enter a value (or press Enter to skip / leave for manual review): ").strip()
         if not answer:
             still_needs_review.append(item)
             continue
@@ -890,6 +1358,78 @@ async def _resolve_needs_review_interactively(
     return still_needs_review
 
 
+async def take_frame_screenshot(page: Page) -> bytes | None:
+    """Full-page JPEG screenshot for a live view, with a safe fallback.
+    full_page=True can fail on very long/lazy-loaded forms (the browser has
+    a max capturable canvas height) -- and not always by raising: on an
+    extreme-height page it's been observed to "succeed" with a 0-byte
+    result instead of throwing, so an empty result is treated as a failure
+    too, not just an exception. A capture against certain page states (seen
+    on Chromium's own internal "New Tab" page) has also been observed to
+    stall outright rather than fail cleanly -- worse than a normal failure,
+    since an un-timed-out await can sit there indefinitely and, in that
+    specific case, was even observed blocking the tab's own subsequent
+    navigation. An explicit timeout turns that into an ordinary handled
+    failure. None of this module's on_frame call sites are wrapped in error
+    handling upstream, so letting either failure mode propagate would
+    silently kill the whole automation run right after a successful fill,
+    not just skip one frame update. Fall back to a viewport-only screenshot,
+    and give up quietly (None) only if even that comes back empty or fails,
+    rather than ever taking the run down over a screenshot."""
+    try:
+        frame = await page.screenshot(type="jpeg", quality=60, full_page=True, timeout=5000)
+        if frame:
+            return frame
+    except Exception:
+        pass
+    try:
+        frame = await page.screenshot(type="jpeg", quality=60, timeout=5000)
+        return frame or None
+    except Exception:
+        return None
+
+
+async def _capture_frame(
+    page: Page, screenshot_dir: str | None, screenshot_prefix: str, step: int, suffix: str,
+    on_frame: Any,
+) -> None:
+    """Take one screenshot and route it to whichever of disk / on_frame are
+    wanted, instead of capturing twice for the same checkpoint."""
+    if not screenshot_dir and on_frame is None:
+        return
+    frame_bytes = await take_frame_screenshot(page)
+    if frame_bytes is None:
+        return
+    if screenshot_dir:
+        with open(f"{screenshot_dir}/{screenshot_prefix}_step{step}_{suffix}.jpg", "wb") as f:
+            f.write(frame_bytes)
+    if on_frame is not None:
+        on_frame(frame_bytes)
+
+
+async def _follow_new_tab_if_opened(page: Page, pages_before: set) -> Page:
+    """After a click that might have opened the real next step in a new tab
+    instead of navigating page in place (seen on some Greenhouse listings'
+    Apply button) -- return that new tab instead, or page itself unchanged
+    if nothing new appeared. Closes any other extras that opened alongside
+    it too (e.g. an ad/tracking redirect tab), same as main.run_automation
+    already does for its own "Original Job Post" click."""
+    new_pages = [p for p in page.context.pages if p not in pages_before]
+    if not new_pages:
+        return page
+    target = new_pages[0]
+    for extra in new_pages[1:]:
+        try:
+            await extra.close()
+        except Exception:
+            pass
+    try:
+        await target.wait_for_load_state()
+    except Exception:
+        pass
+    return target
+
+
 async def autofill_form_multistep(
     page: Page,
     profile: dict[str, Any],
@@ -900,6 +1440,9 @@ async def autofill_form_multistep(
     screenshot_prefix: str = "form",
     interactive: bool = True,
     on_needs_review: Any = None,
+    ask_fn: Any = None,
+    on_frame: Any = None,
+    log: Any = print,
 ) -> AutofillResult:
     """Fill a (possibly multi-step) application form, advancing through
     Next/Continue steps up to max_steps. Also handles landing pages with no
@@ -909,12 +1452,36 @@ async def autofill_form_multistep(
     confidently answer and remembers the answer in profile['custom_answers'].
 
     on_needs_review, if given, is called with the list of needs_review items
-    right before blocking on the interactive terminal prompts -- e.g. to fire
-    a notification the moment the AI hands off to a human, since the prompts
-    themselves block until someone is actually there to answer them."""
+    right before blocking on the interactive prompts -- e.g. to fire a
+    notification the moment the AI hands off to a human, since the prompts
+    themselves block until someone is actually there to answer them.
+
+    ask_fn, if given, is passed through to _resolve_needs_review_interactively
+    in place of the terminal input() prompt -- see its docstring.
+
+    on_frame, if given, is a synchronous callable(jpeg_bytes) fed a screenshot
+    at each point one's already being taken (before/after each step, before
+    each per-field prompt) -- e.g. to drive a live view of the page.
+
+    log, if given, replaces plain print() for mapping progress/failure
+    messages, so a GUI backed by a log() callback (e.g. webapp.py) actually
+    sees why a batch failed instead of it only landing in the terminal.
+
+    If a step's fields look like a login gate for an EXISTING account (see
+    _looks_like_login_gate), or the only apply entry point on the page is a
+    third-party OAuth shortcut (Apply with LinkedIn/GitHub/etc., see
+    _only_third_party_apply_available) with no manual option, stops
+    immediately without attempting anything on that step -- there's no
+    password in the profile that could possibly be right for an account
+    this automation never registered, and it should never complete a
+    third-party login on your behalf -- and returns with
+    login_required=True so the caller can pause for a human instead of
+    guessing."""
+    original_page = page
     all_filled: list[str] = []
     all_needs_review: list[dict[str, Any]] = []
     all_errors: list[dict[str, Any]] = []
+    login_required = False
 
     await dismiss_cookie_banner(page)
 
@@ -923,14 +1490,26 @@ async def autofill_form_multistep(
         # many career sites keep a persistent header (search box, language
         # picker, etc.) that shows up as "fields" even on the pre-application
         # landing page, so we still need to check for an entry button even when
-        # fields are already present. But a bare "Apply" match is only safe to
-        # try when there are truly zero fields yet -- seeing any fields already
-        # means clicking a bare "Apply" risks hitting an unrelated shortcut
-        # instead of just filling what's already there (see find_entry_button).
+        # fields are already present. But a bare "Apply" match (and the vision
+        # fallback below) are only safe to try when there are truly zero REAL
+        # fields yet -- seeing any already means clicking a bare "Apply" risks
+        # hitting an unrelated shortcut instead of just filling what's already
+        # there (see find_entry_button). "Real" excludes fields extract_fields
+        # couldn't label at all ("(unlabeled)") -- almost always the same kind
+        # of page chrome noise, not anything actually answerable, and letting
+        # its mere presence block the entry-button/vision fallback wastes an
+        # LLM call mapping nothing useful and surfaces a blank, labelless
+        # review prompt instead of ever finding the real Apply button.
         fields = await extract_fields(page)
+        real_fields = [f for f in fields if f.label != "(unlabeled)"]
 
-        entry_button = await find_entry_button(page, allow_bare_apply=not fields)
+        if await _looks_like_login_gate(page, fields):
+            login_required = True
+            break
+
+        entry_button = await find_entry_button(page, allow_bare_apply=not real_fields)
         if entry_button is not None:
+            pages_before = set(page.context.pages)
             try:
                 await entry_button.click(timeout=5000)
             except Exception:
@@ -941,39 +1520,83 @@ async def autofill_form_multistep(
                         break
                 else:
                     break
+            new_page = await _follow_new_tab_if_opened(page, pages_before)
+            if new_page is not page:
+                log("  Apply opened the real application in a new tab -- following it.")
+                page = new_page
             await _settle(page)
             continue
 
-        if not fields:
+        if not real_fields:
+            if await _only_third_party_apply_available(page):
+                login_required = True
+                break
+            # Only worth the extra latency of a vision-model screenshot check
+            # on the very first step -- by later steps we're already past
+            # whatever entry gate this page has, and an empty step there
+            # legitimately just means the form is done (e.g. only a Submit
+            # button left, which this automation never clicks anyway).
+            if step == 0:
+                vision_button_text = await _vision_find_apply_button_text(page)
+                if vision_button_text is not None:
+                    log(f"  No Apply button found via the normal page inspection, but a "
+                        f"vision check spotted something labeled \"{vision_button_text}\" -- trying that.")
+                    if await _click_by_visible_text(page, vision_button_text):
+                        await _settle(page)
+                        continue
+                    log(f"  Couldn't click \"{vision_button_text}\" after all.")
             break
 
-        if screenshot_dir:
-            await page.screenshot(path=f"{screenshot_dir}/{screenshot_prefix}_step{step}_before.png")
+        await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
 
-        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields)
+        result = await autofill_form(page, profile, resume_path, cover_letter_path, fields=fields, log=log, on_frame=on_frame)
         remaining_needs_review = result.needs_review
         if remaining_needs_review and on_needs_review is not None:
             on_needs_review(remaining_needs_review)
         if interactive and remaining_needs_review:
-            remaining_needs_review = await _resolve_needs_review_interactively(page, profile, remaining_needs_review)
+            remaining_needs_review = await _resolve_needs_review_interactively(
+                page, profile, remaining_needs_review, ask_fn=ask_fn, on_frame=on_frame
+            )
 
         all_filled.extend(result.filled)
         all_needs_review.extend(remaining_needs_review)
         all_errors.extend(result.errors)
 
-        if screenshot_dir:
-            await page.screenshot(path=f"{screenshot_dir}/{screenshot_prefix}_step{step}_after.png")
+        await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "after", on_frame)
 
         next_button = await find_next_button(page)
         if next_button is None:
             break
+        pages_before = set(page.context.pages)
         try:
             await next_button.click(timeout=5000)
         except Exception:
             break
+        new_page = await _follow_new_tab_if_opened(page, pages_before)
+        if new_page is not page:
+            log("  Continuing opened the next step in a new tab -- following it.")
+            page = new_page
         await _settle(page)
 
-    return AutofillResult(filled=all_filled, needs_review=all_needs_review, errors=all_errors)
+    # An all-empty result (nothing filled, nothing flagged, no errors) reads
+    # as unqualified success to a caller -- correct when a form was already
+    # fully filled by an earlier step and the last step just has a Submit
+    # button left, but misleading if this loop actually never managed to
+    # fill or even find anything at all (e.g. an Apply button that couldn't
+    # be found or clicked, even after the vision fallback above). Only flag
+    # it when nothing whatsoever was accomplished across the whole call --
+    # a login_required result already explains itself to the caller.
+    if not login_required and not (all_filled or all_needs_review or all_errors):
+        all_errors.append({
+            "label": "(page)",
+            "error": "No form fields or Apply-style button could be found on this page -- "
+                     "check the browser window.",
+        })
+
+    return AutofillResult(
+        filled=all_filled, needs_review=all_needs_review, errors=all_errors, login_required=login_required,
+        final_page=page if page is not original_page else None,
+    )
 
 
 async def _settle(page: Page) -> None:

@@ -3,3 +3,6 @@ ollama
 anthropic
 pytest
 pytest-asyncio
+fastapi
+uvicorn[standard]
+httpx
