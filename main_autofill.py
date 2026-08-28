@@ -180,6 +180,40 @@ def test_is_second_address_field_matches_common_phrasings():
     assert not autofill._is_second_address_field("Captain of a sports team? (optional)")
 
 
+def test_is_phone_extension_field_matches_common_phrasings():
+    assert autofill._is_phone_extension_field("Phone Extension")
+    assert autofill._is_phone_extension_field("Extension")
+    assert autofill._is_phone_extension_field("Ext.")
+    assert autofill._is_phone_extension_field("Ext")
+    assert not autofill._is_phone_extension_field("Phone Number")
+    assert not autofill._is_phone_extension_field("Phone")
+    # Regression: "ext" as a bare substring shouldn't match words that
+    # merely contain it, e.g. "context" or "external".
+    assert not autofill._is_phone_extension_field("External Recruiter?")
+    assert not autofill._is_phone_extension_field("Additional context")
+
+
+async def test_autofill_form_skips_phone_extension_field_entirely(monkeypatch):
+    # Per explicit user preference -- same treatment as the second address
+    # line: never filled, never flagged for review, just disappears.
+    fields = [
+        FormField("f0", "Phone", "tel", '[data-autofill-id="f0"]'),
+        FormField("f1", "Extension", "text", '[data-autofill-id="f1"]'),
+    ]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock(
+        return_value=[{"field_id": "f0", "value": "813-219-2242", "needs_review": False, "reasoning": ""}]
+    )
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage()
+    result = await autofill.autofill_form(page, PROFILE, resume_path="resume.pdf")
+
+    assert result.needs_review == []
+    mapped_fields = get_mappings_mock.call_args[0][0] if get_mappings_mock.called else []
+    assert all(f.field_id != "f1" for f in mapped_fields)
+
+
 async def test_autofill_form_skips_second_address_field_entirely(monkeypatch):
     # Per explicit user preference: never fill it, never flag it for manual
     # review either -- it should disappear from the result entirely, not
@@ -229,6 +263,7 @@ def test_match_profile_field_key_matches_common_contact_fields():
     assert autofill._match_profile_field_key("Legal First Name") == "first_name"
     assert autofill._match_profile_field_key("Last Name") == "last_name"
     assert autofill._match_profile_field_key("Preferred Name") == "preferred_name"
+    assert autofill._match_profile_field_key("Preferred Full Name") == "preferred_full_name"
     assert autofill._match_profile_field_key("What should we call you?") is None
     assert autofill._match_profile_field_key("Email") == "email"
     assert autofill._match_profile_field_key("Email Address") == "email"
@@ -238,6 +273,8 @@ def test_match_profile_field_key_matches_common_contact_fields():
     assert autofill._match_profile_field_key("University") == "school"
     assert autofill._match_profile_field_key("Degree") == "degree"
     assert autofill._match_profile_field_key("Country") == "country"
+    assert autofill._match_profile_field_key("State") == "state"
+    assert autofill._match_profile_field_key("State/Province") == "state"
 
 
 def test_match_profile_field_key_excludes_phone_country_code():
@@ -1788,3 +1825,43 @@ def test_get_mappings_handles_bare_list_response(monkeypatch):
     result = autofill.get_mappings(fields, PROFILE)
 
     assert result == [{"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": ""}]
+
+
+def test_call_ollama_passes_keep_alive(monkeypatch):
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        return {"message": {"content": '{"mappings": []}'}}
+
+    monkeypatch.setattr("ollama.chat", fake_chat)
+    autofill._call_ollama("test content")
+
+    assert calls[0]["keep_alive"] == autofill.OLLAMA_KEEP_ALIVE
+
+
+def test_warm_up_ollama_calls_chat_with_keep_alive(monkeypatch):
+    # Fires a throwaway call so the model is already loading/loaded by the
+    # time the first real mapping batch needs it (see main.run_automation).
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        return {"message": {"content": "hi"}}
+
+    monkeypatch.setattr("ollama.chat", fake_chat)
+    autofill.warm_up_ollama()
+
+    assert len(calls) == 1
+    assert calls[0]["model"] == autofill.OLLAMA_MODEL
+    assert calls[0]["keep_alive"] == autofill.OLLAMA_KEEP_ALIVE
+
+
+def test_warm_up_ollama_swallows_errors(monkeypatch):
+    # Best-effort only -- Ollama not running yet, or any other failure,
+    # must not take the whole automation down over a warm-up attempt.
+    def fake_chat(**kwargs):
+        raise Exception("ollama not reachable")
+
+    monkeypatch.setattr("ollama.chat", fake_chat)
+    autofill.warm_up_ollama()  # must not raise

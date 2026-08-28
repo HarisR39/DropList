@@ -42,6 +42,13 @@ ANTHROPIC_MODEL = "claude-sonnet-5"
 # even though it's plainly visible on screen.
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
 VISION_TIMEOUT_SECONDS = int(os.environ.get("AUTOFILL_VISION_TIMEOUT", "60"))
+# How long Ollama keeps a model resident in memory after each call before
+# unloading it (Ollama's own default is 5 minutes). A run can easily go
+# longer than that between mapping calls -- reviewing one listing, picking
+# the next -- so the model would otherwise unload and cold-start-reload on
+# the next call. "30m" comfortably covers a normal gap between listings
+# without keeping it loaded forever after the whole program has exited.
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 # Applies per batch (see MAPPING_BATCH_SIZE), not to the form as a whole --
 # fields are mapped and filled one batch at a time, so a slow/stuck batch
 # only costs its own fields, not the whole form's progress.
@@ -145,6 +152,12 @@ Rules:
   for a field that explicitly asks for a preferred name, nickname, chosen name, or "name you
   go by" — never substitute it for a plain "First Name" field just because it's shorter or
   more casual.
+- A profile's "education_start_date" is when the candidate started their most recent degree
+  program; "graduation_date" is when they finished (or expect to). A field asking "start
+  date", "start term", or "enrollment date" wants "education_start_date"; a field asking
+  "end date", "graduation date", or "expected graduation" wants "graduation_date". These are
+  two different dates — never fill both with the same value, and never substitute one for
+  the other just because they're both dates in the profile.
 
 Respond with ONLY valid JSON matching this schema, no preamble or markdown:
 {
@@ -181,10 +194,8 @@ class AutofillResult:
     # Greenhouse listings), and autofill_form_multistep follows that new
     # tab internally. Compare against whatever page you passed in: if it
     # differs, callers that track the page across calls (main.run_
-    # automation's company_page/known_pages) need to switch to it too, or
-    # they'll keep looking at the original, now-abandoned tab -- which also
-    # makes the real one look like an unrecognized extra page (see
-    # main._find_login_popup).
+    # automation's company_page) need to switch to it too, or they'll keep
+    # looking at the original, now-abandoned tab instead of the real one.
     final_page: Any = None
 
 
@@ -409,12 +420,34 @@ def _call_ollama(user_content: str, num_predict: int = 4096) -> str:
         model=OLLAMA_MODEL,
         format="json",
         options={"num_predict": num_predict},
+        keep_alive=OLLAMA_KEEP_ALIVE,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
     )
     return response["message"]["content"]
+
+
+def warm_up_ollama() -> None:
+    """Force OLLAMA_MODEL into memory right away with a throwaway call,
+    instead of letting the first real mapping batch be the one that pays
+    the cold-start cost. Meant to be kicked off in the background (see
+    main.run_automation) right as the browser session starts, so the model
+    load overlaps with jobright login/navigation instead of blocking the
+    first listing's mapping call. Best-effort -- a failure here just means
+    the first real call ends up paying the cold-start cost as before,
+    exactly like if this had never been called at all."""
+    import ollama
+    try:
+        ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            options={"num_predict": 1},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+    except Exception:
+        pass
 
 
 APPLY_VISION_PROMPT = (
@@ -813,16 +846,32 @@ def _is_second_address_field(label: str) -> bool:
     return SECOND_ADDRESS_LABEL_KEYWORD_PATTERN.search(lowered) is not None
 
 
+# \b word-boundary match (not a bare substring) so this doesn't fire on
+# unrelated words that merely contain "ext" -- matches "ext"/"ext."
+# equally well as "extension", since the trailing period still counts as a
+# word-to-non-word boundary.
+PHONE_EXTENSION_LABEL_PATTERN = re.compile(r"\b(extension|ext)\b", re.IGNORECASE)
+
+
+def _is_phone_extension_field(label: str) -> bool:
+    # Per explicit user preference -- no extension to give, and it's always
+    # optional, same rationale as the second-address-line field below.
+    return PHONE_EXTENSION_LABEL_PATTERN.search(label.strip().lower()) is not None
+
+
 def _ignored_field_ids(fields: list[FormField]) -> set[str]:
     """Field ids to skip entirely -- never filled, never flagged for manual
-    review, never even shown to the LLM. Currently just the near-universal
-    optional "Address Line 2"/"Apt/Suite/Unit" field: per explicit user
-    preference, this automation doesn't bother with a second address line at
-    all, and silently skipping it (rather than leaving it null+needs_review)
-    avoids cluttering every single application's review list with a field
-    that's essentially always optional and never actually needs a human
-    decision."""
-    return {f.field_id for f in fields if _is_second_address_field(f.label)}
+    review, never even shown to the LLM. Currently the near-universal
+    optional "Address Line 2"/"Apt/Suite/Unit" field, and any "Phone
+    Extension" field: per explicit user preference, this automation doesn't
+    bother with either at all, and silently skipping them (rather than
+    leaving them null+needs_review) avoids cluttering every single
+    application's review list with fields that are essentially always
+    optional and never actually need a human decision."""
+    return {
+        f.field_id for f in fields
+        if _is_second_address_field(f.label) or _is_phone_extension_field(f.label)
+    }
 
 
 def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
@@ -856,6 +905,11 @@ def _custom_answer_mappings(fields: list[FormField], profile: dict[str, Any]) ->
 # (e.g. "preferred name") are listed before more general ones they'd
 # otherwise be swallowed by.
 PROFILE_FIELD_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Must come before the bare "preferred name" pattern below -- "preferred
+    # full name" wouldn't actually match it (it requires "preferred" directly
+    # followed by "name", not with "full" in between), but keeping the more
+    # specific one first matches this list's own stated convention.
+    (re.compile(r"\bpreferred\s*full\s*name\b", re.I), "preferred_full_name"),
     (re.compile(r"\bpreferred\s*name\b|\bnickname\b|\bname\s+you\s+go\s+by\b|\bchosen\s*name\b", re.I), "preferred_name"),
     (re.compile(r"\bfirst\s*name\b|\bgiven\s*name\b", re.I), "first_name"),
     (re.compile(r"\blast\s*name\b|\bsurname\b|\bfamily\s*name\b", re.I), "last_name"),
@@ -867,6 +921,7 @@ PROFILE_FIELD_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bdegree\b", re.I), "degree"),
     (re.compile(r"\bfield\s*of\s*study\b|\bmajor\b", re.I), "field_of_study"),
     (re.compile(r"\bcountry\b", re.I), "country"),
+    (re.compile(r"\bstate\b|\bprovince\b", re.I), "state"),
 ]
 # "Phone Country Code" / "Dial Code" / "Area Code" ask for a short numeric
 # code, not the candidate's full phone number or country name -- must be

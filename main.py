@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 import application_tracking
-from autofill import AutofillResult, autofill_form_multistep, take_frame_screenshot
+from autofill import LLM_PROVIDER, AutofillResult, autofill_form_multistep, take_frame_screenshot, warm_up_ollama
 
 MAX_FORM_STEPS = 6
 SCREENSHOT_DIR = "screenshots"
@@ -67,22 +67,6 @@ def load_profile() -> dict:
 def save_profile(profile: dict) -> None:
     with open("profile.json", "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2)
-
-
-def _find_login_popup(company_page, known_pages: set):
-    """Any page in this browser context that isn't one this automation
-    already knows about -- e.g. an OAuth "Continue with Google/LinkedIn"
-    flow opening its own window. Best-effort: there's no reliable way to
-    positively identify a login popup by URL/title across arbitrary
-    providers, so any unexpected extra page is treated as one.
-
-    known_pages must cover jobright's own tab AND every company tab ever
-    opened THIS RUN, not just the current listing's -- earlier listings'
-    company tabs are deliberately left open (so you can still review/submit
-    them later), and checking against only the current pair used to
-    misidentify every one of them as a login popup on every later listing."""
-    extras = [p for p in company_page.context.pages if p not in known_pages]
-    return extras[0] if extras else None
 
 
 def notify(message: str) -> None:
@@ -246,8 +230,7 @@ async def _pick_target_page(page, known_pages: set, i: int, confirm_or_reset, lo
     if company_page is not None:
         # A single click can occasionally open more than one new tab (e.g.
         # an ad/tracking redirect alongside the real destination) -- close
-        # the extras immediately so they don't clutter the browser or get
-        # mistaken for a genuine login popup later (see _find_login_popup).
+        # the extras immediately so they don't clutter the browser.
         for extra in page.context.pages:
             if extra not in pages_before and extra is not company_page:
                 try:
@@ -298,7 +281,6 @@ async def _fill_review_retry_loop(
     like confirm_or_reset callers always have."""
     while True:
         result = None
-        login_popup = None
 
         if company_page is not None:
             # let redirects/dynamic content settle before reading the form.
@@ -324,9 +306,16 @@ async def _fill_review_retry_loop(
                     f"won't click anything here.")
                 result = AutofillResult(filled=[], needs_review=[], errors=[], login_required=True)
             else:
-                login_popup = _find_login_popup(company_page, known_pages)
-
-            if login_popup is None and result is None:
+                # No pre-flight "is there a login popup open" check here on
+                # purpose -- that used to look at every other tab open in
+                # the browser context and treat any unrecognized one as a
+                # login popup, which kept misidentifying legitimate parts
+                # of a normal apply flow (an ATS's own "continue where you
+                # left off" step, an SSO redirect that's part of applying
+                # itself, etc.) as blocking. autofill_form_multistep's own
+                # _looks_like_login_gate below -- which reads the actual
+                # page content, not just "a tab exists" -- is what still
+                # catches a real login gate.
                 try:
                     result = await autofill_form_multistep(
                         company_page,
@@ -356,9 +345,7 @@ async def _fill_review_retry_loop(
                 # new tab instead of navigating in place (see
                 # autofill.AutofillResult.final_page) -- follow it here
                 # too, or the old, now-abandoned tab stays what this
-                # loop (and _find_login_popup) keeps looking at, while
-                # the real one sits unrecognized and gets mistaken for
-                # a login popup.
+                # loop keeps operating on.
                 if result is not None and result.final_page is not None \
                         and result.final_page is not company_page:
                     company_page = result.final_page
@@ -369,21 +356,11 @@ async def _fill_review_retry_loop(
                 # entries from what you typed in during this listing -- persist those.
                 save_profile(profile)
 
-                # A login popup can also appear as a side effect of the fill
-                # attempt itself (e.g. clicking a "Continue with Google" button
-                # partway through a multi-step form) -- check again now.
-                login_popup = _find_login_popup(company_page, known_pages)
-
             # Notify as soon as the AI's autofill attempt is done, one way or
             # another -- success, needs review, failed, or blocked on login --
             # not just when the application ends up fully ready to submit. You
             # might be away from the browser and want to know it's done either way.
-            if login_popup is not None:
-                log(f"[{i}] A login window opened ({login_popup.url}) -- log in "
-                    f"yourself, then close it and retry autofill.")
-                notify(f"[{i}] A login window opened -- log in "
-                       f"yourself to continue.")
-            elif result is not None and result.login_required:
+            if result is not None and result.login_required:
                 log(f"[{i}] This page looks like it wants you to log "
                     f"into an existing account, or only offers a third-party option like "
                     f"\"Apply with LinkedIn/GitHub\" -- handle that yourself in the "
@@ -415,7 +392,7 @@ async def _fill_review_retry_loop(
             if frame_bytes is not None:
                 on_frame(frame_bytes)
 
-        needs_login = login_popup is not None or (result is not None and result.login_required)
+        needs_login = result is not None and result.login_required
         if needs_login:
             action = confirm_or_reset(
                 f"[{i}] It looks like this page wants you to log in, "
@@ -554,14 +531,16 @@ async def run_automation(
     Unlike stopping and restarting the whole run, this never closes the
     browser or re-authenticates.
 
-    If a company page looks like it wants you to log into an existing
-    account -- either autofill_form_multistep detects a login gate on the
-    page itself (see its docstring / autofill._looks_like_login_gate), or a
-    separate popup window opens (e.g. an OAuth "Continue with Google/
-    LinkedIn" flow) -- autofill is skipped for that attempt and the review
-    pause explains what's going on instead of presenting it as an ordinary
-    review. Log in yourself, then choose Retry to have the AI take another
-    pass, or Continue to move on without retrying."""
+    If a company page's own content looks like it wants you to log into an
+    existing account (see autofill_form_multistep's docstring /
+    autofill._looks_like_login_gate), autofill is skipped for that attempt
+    and the review pause explains what's going on instead of presenting it
+    as an ordinary review. Log in yourself, then choose Retry to have the
+    AI take another pass, or Continue to move on without retrying. (There
+    used to also be a check for any unrecognized extra browser tab being
+    treated as a login popup -- removed, since it kept misidentifying
+    ordinary parts of a normal apply flow, like an ATS's own "continue
+    where you left off" step, as blocking.)"""
     confirm = confirm_fn or (lambda prompt, retryable=False, allow_apply_current=False: input(prompt))
     # Wiped at the start of every run rather than left to accumulate --
     # these are only ever useful for reviewing the run that's about to
@@ -621,15 +600,23 @@ async def run_automation(
         # confirmed to happen in plain terminal use too, with no webapp/live
         # view involved at all. See _redirect_new_tabs_away_from_ntp.
         _redirect_new_tabs_away_from_ntp(page.context)
+        if LLM_PROVIDER == "ollama":
+            # Fire-and-forget: overlaps the model's cold-start load with the
+            # jobright login below instead of the first listing's mapping
+            # call being the one to pay for it. warm_up_ollama() is a
+            # blocking call, so it needs its own thread to actually run
+            # concurrently with the awaits that follow.
+            asyncio.create_task(asyncio.to_thread(warm_up_ollama))
         # {"page": ...} rather than a plain variable so _live_view_loop
         # (started right below) always picks up whichever page is currently
         # relevant on its next tick -- repointed at company_page/back to
         # page itself at the few places below where that changes.
         current_page = {"page": page}
-        # Every page _find_login_popup should never mistake for a login
-        # popup -- jobright's own tab plus every company tab opened over
-        # the course of this whole run (see _find_login_popup's docstring),
-        # not just the current listing's.
+        # Every page this run already knows about -- jobright's own tab
+        # plus every company tab opened so far -- so "apply current" (see
+        # _pick_target_page) can tell a tab you just opened by hand apart
+        # from ones already in play, across the whole run, not just the
+        # current listing's.
         known_pages = {page}
         live_view_task = asyncio.create_task(_live_view_loop(current_page, on_frame)) if on_frame is not None else None
         # current_page is repointed explicitly at every point where the
