@@ -4,6 +4,7 @@ import pytest
 
 import autofill
 import mapping_cache
+import workday
 from autofill import AutofillResult, FormField
 
 
@@ -336,6 +337,79 @@ async def test_autofill_form_leaves_unmatched_profile_field_for_llm(monkeypatch)
 
     get_mappings_mock.assert_called_once()
     assert len(result.needs_review) == 1
+
+
+async def test_autofill_form_uses_workday_layer_on_workday_domain(monkeypatch):
+    # workday.py claims fields autofill.py's own generic layers leave
+    # unhandled -- confirms the wiring actually calls it, and that doing so
+    # skips the LLM entirely for a field it claims.
+    fields = [FormField(
+        "f0", "Gender", "radio-group", "", options=["Male", "Female", "Decline To Self Identify"],
+        option_selectors=["[data-autofill-id=\"o0\"]", "[data-autofill-id=\"o1\"]", "[data-autofill-id=\"o2\"]"],
+    )]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock()
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage(url="https://acme.wd5.myworkdayjobs.com/en-US/apply")
+    profile = {**PROFILE, "gender": "Decline To Self Identify"}
+    result = await autofill.autofill_form(page, profile, resume_path="resume.pdf")
+
+    get_mappings_mock.assert_not_called()
+    assert result.filled == ["Gender"]
+
+
+async def test_autofill_form_does_not_use_workday_layer_off_workday_domain(monkeypatch):
+    fields = [FormField("f0", "Gender", "radio-group", "", options=["Male", "Female", "Decline To Self Identify"])]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    get_mappings_mock = MagicMock(
+        return_value=[{"field_id": "f0", "value": None, "needs_review": True, "reasoning": "n/a"}]
+    )
+    monkeypatch.setattr(autofill, "get_mappings", get_mappings_mock)
+
+    page = FakePage(url="https://boards.greenhouse.io/acme")
+    profile = {**PROFILE, "gender": "Decline To Self Identify"}
+    result = await autofill.autofill_form(page, profile, resume_path="resume.pdf")
+
+    get_mappings_mock.assert_called_once()
+    assert result.filled == []
+
+
+async def test_multistep_calls_workday_fill_experience_sections_on_workday_domain(monkeypatch):
+    fields = [FormField("f0", "First Name", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": "x"}],
+    )
+    experience_mock = AsyncMock(return_value=["title (entry 1)"])
+    monkeypatch.setattr(workday, "fill_experience_sections", experience_mock)
+
+    page = FakePage(url="https://acme.wd5.myworkdayjobs.com/en-US/apply")
+    result = await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", interactive=False)
+
+    experience_mock.assert_awaited_once_with(page, PROFILE, log=print)
+    assert "title (entry 1)" in result.filled
+
+
+async def test_multistep_skips_workday_layer_off_workday_domain(monkeypatch):
+    fields = [FormField("f0", "First Name", "text", '[data-autofill-id="f0"]')]
+    monkeypatch.setattr(autofill, "extract_fields", AsyncMock(return_value=fields))
+    monkeypatch.setattr(autofill, "find_entry_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(autofill, "find_next_button", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        autofill, "get_mappings",
+        lambda fields, profile: [{"field_id": "f0", "value": "Jane", "needs_review": False, "reasoning": "x"}],
+    )
+    experience_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(workday, "fill_experience_sections", experience_mock)
+
+    page = FakePage(url="https://boards.greenhouse.io/acme")
+    await autofill.autofill_form_multistep(page, PROFILE, resume_path="resume.pdf", interactive=False)
+
+    experience_mock.assert_not_awaited()
 
 
 async def test_select_value_not_in_options_becomes_needs_review(monkeypatch):
@@ -1013,6 +1087,47 @@ async def test_looks_like_login_gate_false_without_a_password_field():
     assert await autofill._looks_like_login_gate(page, fields) is False
 
 
+async def test_looks_like_login_gate_false_on_workday_for_already_have_an_account_phrase():
+    # Workday's own create-account page legitimately shows an "Already have
+    # an Account? Sign In" toggle even while you're on the create-account
+    # form -- unlike every other ATS, so this phrase alone shouldn't stop a
+    # fresh Workday signup before it can even run.
+    page = FakePage(url="https://acme.wd5.myworkdayjobs.com/en-US/apply")
+    page.set_text("Already have an Account? Sign In", count=1)
+    fields = [
+        FormField("f0", "Email", "email", '[data-autofill-id="f0"]'),
+        FormField("f1", "New Password", "password", '[data-autofill-id="f1"]'),
+    ]
+
+    assert await autofill._looks_like_login_gate(page, fields) is False
+
+
+async def test_looks_like_login_gate_true_on_workday_for_stronger_returning_user_phrase():
+    # A stronger signal ("welcome back") should still gate on Workday --
+    # only the "already have an account" phrase is excluded there.
+    page = FakePage(url="https://acme.wd5.myworkdayjobs.com/en-US/apply")
+    page.set_text("Welcome back", count=1)
+    fields = [
+        FormField("f0", "Email", "email", '[data-autofill-id="f0"]'),
+        FormField("f1", "Password", "password", '[data-autofill-id="f1"]'),
+    ]
+
+    assert await autofill._looks_like_login_gate(page, fields) is True
+
+
+async def test_looks_like_login_gate_true_off_workday_for_already_have_an_account_phrase():
+    # The exclusion is Workday-specific -- every other ATS keeps the
+    # original, stricter behavior.
+    page = FakePage(url="https://boards.greenhouse.io/acme")
+    page.set_text("Already have an account", count=1)
+    fields = [
+        FormField("f0", "Email", "email", '[data-autofill-id="f0"]'),
+        FormField("f1", "Password", "password", '[data-autofill-id="f1"]'),
+    ]
+
+    assert await autofill._looks_like_login_gate(page, fields) is True
+
+
 async def test_looks_like_login_gate_false_for_large_forms_even_with_phrase_and_password():
     # A real application form can legitimately have a password field (new
     # account creation) alongside many other real fields -- a large field
@@ -1272,6 +1387,14 @@ async def test_find_entry_button_matches_apply_now_link():
 async def test_find_entry_button_returns_none_when_absent():
     page = FakePage()
     assert await autofill.find_entry_button(page) is None
+
+
+async def test_find_next_button_matches_workday_create_account_button():
+    # Workday's account-creation step submits via a "Create Account" button
+    # rather than "Next"/"Continue" -- see NEXT_BUTTON_NAMES.
+    page = FakePage()
+    page.set_role_button("button", "Create Account")
+    assert await autofill.find_next_button(page) is not None
 
 
 async def test_find_entry_button_matches_dynamic_job_title_button():

@@ -12,8 +12,9 @@ DropList signs into jobright.ai, lets you pick a listing at a time, opens the re
 pip install -r requirements.txt
 playwright install chromium
 
-pytest                              # full suite (132 tests)
+pytest                              # full suite (166 tests)
 pytest main_autofill.py             # autofill.py's suite only
+pytest test_workday.py              # workday.py's suite only
 pytest test_webapp.py               # webapp.py's suite only
 pytest test_main.py                 # main.py's pure-logic suite only
 pytest main_autofill.py -k some_name -v   # a single test
@@ -65,6 +66,12 @@ There's no embedded browser in the page — screenshots get pushed at specific m
 ### Browser launch specifics that look arbitrary but aren't
 
 `p.chromium.launch(channel="chrome", ...)` drives the real installed Google Chrome, not Playwright's bundled Chromium — some ATS sites behave differently under bot detection for an obviously-automated browser fingerprint. `--disable-blink-features=AutomationControlled` plus a `navigator.webdriver` override init script are the same fight. `_redirect_new_tabs_away_from_ntp` immediately navigates any tab you open by hand to `about:blank`, racing ahead of Chrome's real New Tab Page (which fetches a Discover feed from Google and was observed hanging under this automation's sync-free profile). None of this is cargo-culted — each exists because of a specific, reproduced failure documented in the comment next to it.
+
+### `workday.py`: a per-ATS deterministic layer, because Workday is the one ATS where that's actually safe
+
+Every other ATS this project handles (Greenhouse, Lever, Ashby, ...) has field wording that genuinely varies employer to employer, which is why `autofill.py`'s deterministic layers stick to generic, low-judgment patterns (a plain "First Name" text field) and leave anything else to the LLM. Workday is different: every `myworkdayjobs.com` site is the same underlying product re-themed per company, so its "My Information" labels, Voluntary Disclosures (EEO) wording, and Self-Identify disability form (the federal OFCCP CC-305 form, used verbatim) are stable enough to hardcode with real confidence — see `workday.py`'s own module docstring. `autofill_form` calls `workday.workday_field_mappings` (gated on `workday.is_workday_domain(page.url)`) after its own generic layers, on whatever fields those left unclaimed, so a Workday application only ever reaches the LLM for a genuinely employer-custom question. `autofill_form_multistep` separately calls `workday.fill_experience_sections` every step (a no-op except on whichever step actually has it) to drive Workday's repeating "Add" Work Experience/Education panels from `profile.json`'s `previous_employers`/`education` — that one can't be expressed as a flat field→value map like the rest, since it has to click "Add" and discover each new panel's fields itself, so it operates on the page directly instead of going through `apply_mapping`.
+
+If a future company/ATS turns out to have this same stability (a similarly walled-garden platform, not a bespoke build), the same pattern — a dedicated module gated behind a domain check, feeding into `apply_mapping` for flat fields and calling the page directly for anything structurally repeating — is the template to follow, not a new branch inside `autofill.py` itself.
 
 ### Job-board vs. company-site distinction
 

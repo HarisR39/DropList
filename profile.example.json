@@ -5,7 +5,12 @@
   "preferred_pronouns": "She/Her",
   "email": "jane.doe@example.com",
   "phone": "555-555-5555",
+  "phone_device_type": "Mobile",
   "location": "San Francisco, CA",
+  "address_line_1": "123 Main St",
+  "city": "San Francisco",
+  "state": "CA",
+  "postal_code": "94105",
   "linkedin_url": "https://linkedin.com/in/janedoe",
   "portfolio_url": "",
   "school": "Example University",
@@ -22,7 +27,17 @@
   "at_least_18_years_of_age": true,
   "willing_to_relocate": true,
   "years_of_experience": 1,
-  "previous_employers": [],
+  "previous_employers": [
+    {
+      "title": "Software Engineering Intern",
+      "company": "Example Corp",
+      "location": "San Francisco, CA",
+      "start_date": "06/2025",
+      "end_date": "08/2025",
+      "current": false,
+      "description": "Built and shipped a feature end to end."
+    }
+  ],
   "skills": ["Python", "JavaScript", "React"],
   "gender": "Decline To Self Identify",
   "hispanic_or_latino": null,

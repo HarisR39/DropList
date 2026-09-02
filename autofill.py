@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 from playwright.async_api import Page
 
 import mapping_cache
+import workday
 
 # "ollama" (local, no API key/billing) or "anthropic" (Claude API).
 LLM_PROVIDER = os.environ.get("AUTOFILL_LLM_PROVIDER", "ollama")
@@ -69,7 +70,12 @@ def _get_anthropic_client():
         _anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     return _anthropic_client
 
-NEXT_BUTTON_NAMES = ["Next", "Continue", "Next Step"]
+# "Create Account" is Workday's own submit-button label for its account-
+# creation step (rather than "Next"/"Continue") -- included globally, not
+# gated behind a Workday check, since a button genuinely named exactly this
+# means "submit and proceed" on any ATS, with no realistic false-positive
+# risk the way a bare "Apply" would have.
+NEXT_BUTTON_NAMES = ["Next", "Continue", "Next Step", "Create Account"]
 # Deliberately NOT a bare "Apply" -- that substring-matches unrelated in-page
 # controls on real application forms (e.g. a "Quick Apply with MyGreenhouse"
 # shortcut, or a small "Apply" pill that just scrolls to the form section),
@@ -523,7 +529,15 @@ def _best_word_overlap_index(value: str, option_texts: list[str]) -> int | None:
     return scores.index(best)
 
 
-OTHER_OPTION_PATTERNS = ["other", "not listed", "none of the above", "not represented here", "not applicable"]
+# "decline"/"prefer not"/etc. are grouped in here alongside the "Other"-style
+# catch-alls -- a voluntary EEO/self-identify question's opt-out option
+# ("I don't wish to answer", "Decline To Self Identify") plays the same role
+# as a plain "Other" option for matching purposes: the last-resort choice
+# when the real answer doesn't match anything else on the list.
+OTHER_OPTION_PATTERNS = [
+    "other", "not listed", "none of the above", "not represented here", "not applicable",
+    "decline", "prefer not", "don't wish", "do not wish", "not want to answer", "not disclose",
+]
 
 
 def _find_other_option_index(option_texts: list[str]) -> int | None:
@@ -731,6 +745,15 @@ LOGIN_GATE_PHRASES = [
     "welcome back", "already have an account", "forgot your password",
     "forgot password", "sign in to your account", "log in to your account",
 ]
+# Workday's own create-account page legitimately shows an "Already have an
+# Account? Sign In" toggle link even while you're actively ON the
+# create-account form -- unlike every other ATS this project handles, where
+# that phrasing only ever shows up on a genuine sign-in page. Left in that
+# phrase, every fresh Workday signup would misfire as a login gate and stop
+# before account creation ever got a chance to run. The other phrases still
+# apply on Workday too, since those only show up on an actual "log back in"
+# page there as well.
+WORKDAY_LOGIN_GATE_PHRASE_EXCLUSIONS = {"already have an account"}
 
 
 async def _looks_like_login_gate(page: Page, fields: list[FormField]) -> bool:
@@ -751,7 +774,10 @@ async def _looks_like_login_gate(page: Page, fields: list[FormField]) -> bool:
         return False
     if not any(f.type == "password" for f in fields):
         return False
+    is_workday = workday.is_workday_domain(page.url)
     for phrase in LOGIN_GATE_PHRASES:
+        if is_workday and phrase in WORKDAY_LOGIN_GATE_PHRASE_EXCLUSIONS:
+            continue
         if await page.get_by_text(phrase, exact=False).count() > 0:
             return True
     return False
@@ -1015,17 +1041,29 @@ async def autofill_form(
         [f for f in fields if f.field_id not in already_handled_ids], profile
     )
     handled_ids = already_handled_ids | profile_handled_ids
+    all_mappings = account_mappings + custom_mappings + consent_mappings + profile_mappings
+
+    # Workday-specific deterministic layer (My Information dropdowns,
+    # Voluntary Disclosures, Self-Identify) -- see workday.py's own
+    # docstring for why this is safe to hardcode for this one ATS
+    # specifically. Only ever offered whatever the layers above didn't
+    # already claim.
+    if workday.is_workday_domain(page.url):
+        workday_mappings, workday_handled_ids = workday.workday_field_mappings(
+            [f for f in fields if f.field_id not in handled_ids], profile
+        )
+        all_mappings += workday_mappings
+        handled_ids |= workday_handled_ids
+
     handled_fields = [f for f in fields if f.field_id in handled_ids]
     remaining = [f for f in fields if f.field_id not in handled_ids]
 
     # Deterministic fields (account signup, remembered custom answers,
-    # boilerplate consent checkboxes, plain profile lookups) need no LLM
-    # call, so fill those in right away rather than waiting on whatever
-    # comes next.
+    # boilerplate consent checkboxes, plain profile lookups, Workday's own
+    # standard fields) need no LLM call, so fill those in right away rather
+    # than waiting on whatever comes next.
     result = await apply_mapping(
-        page, handled_fields,
-        account_mappings + custom_mappings + consent_mappings + profile_mappings,
-        resume_path, cover_letter_path, on_frame=on_frame,
+        page, handled_fields, all_mappings, resume_path, cover_letter_path, on_frame=on_frame,
     )
 
     if remaining:
@@ -1601,6 +1639,21 @@ async def autofill_form_multistep(
                         continue
                     log(f"  Couldn't click \"{vision_button_text}\" after all.")
             break
+
+        if workday.is_workday_domain(page.url):
+            # Best-effort, direct-page-interaction driver for Workday's
+            # repeating "Add" work-experience/education panels -- can't be
+            # expressed as a flat field->value map like the rest of this
+            # module's deterministic layers, since it has to click "Add"
+            # and discover each new panel's fields itself. A no-op on any
+            # step that doesn't actually have this section (see
+            # workday.fill_experience_sections), so safe to call on every
+            # step of a Workday application, not just the one that turns
+            # out to have it.
+            experience_filled = await workday.fill_experience_sections(page, profile, log=log)
+            if experience_filled:
+                all_filled.extend(experience_filled)
+                fields = await extract_fields(page)
 
         await _capture_frame(page, screenshot_dir, screenshot_prefix, step, "before", on_frame)
 

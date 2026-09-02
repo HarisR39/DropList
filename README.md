@@ -35,6 +35,20 @@ If `NTFY_TOPIC` is set, [ntfy.sh](https://ntfy.sh) push notifications fire at th
 
 Install the ntfy app, subscribe to a topic of your choosing (pick something random/hard-to-guess — topics are public by default), and set `NTFY_TOPIC` to that value.
 
+## Workday support
+
+Every `myworkdayjobs.com` site runs the same underlying Workday Recruiting product, just re-themed per company — unlike Greenhouse/Lever/Ashby/etc., where field wording genuinely varies employer to employer, Workday's own "My Information" labels, Voluntary Disclosures (EEO) wording, and Self-Identify disability form (the federal OFCCP CC-305 form, used verbatim) are close to identical everywhere. `workday.py` takes advantage of that: on a Workday domain, it hardcodes these fields directly from `profile.json` instead of spending an LLM call on them —
+
+- **My Information**: name, email, phone, address, city, state, postal code, country, phone device type — including the select/combobox variants of State/Country/Phone Device Type that the generic profile-matching layer skips (it only trusts plain-text fields on an arbitrary, unknown ATS).
+- **Voluntary Disclosures**: gender, race/ethnicity, veteran status, Hispanic-or-Latino — answered only from an explicit profile value, same "never infer" rule as everywhere else in this project.
+- **Self-Identify**: the disability question, plus its "signature" name and today's-date fields — detected by the CC-305 form's own option wording, not by page structure, so it doesn't depend on knowing Workday's exact markup.
+- **Work Experience / Education**: drives Workday's repeating "Add" panels from `profile.json`'s `previous_employers` list and `school`/`degree`/`field_of_study`/`graduation_date` (or an optional `education` list for more than one degree). Best-effort and fails closed — if an "Add" button or an expected field can't be found confidently, that section is left for you to fill in manually rather than risking a wrong click.
+- **Account creation**: Workday's account-creation step is recognized and driven like any other new-account signup (`profile['account_email']`/`profile['account_password']`) — its own "Already have an Account? Sign In" toggle text is specifically excluded from the login-gate check (that phrase would otherwise misfire as a returning-user login page on Workday, and only there), and its "Create Account" submit button is recognized alongside "Next"/"Continue".
+
+A genuinely employer-custom question (an essay prompt, a company-specific eligibility check) still isn't something Workday standardizes, so those still go through the normal LLM/needs-review path like on any other ATS.
+
+New `profile.json` keys this uses: `address_line_1`, `city`, `state`, `postal_code`, `phone_device_type` (defaults to `"Mobile"` if unset). See `profile.example.json`.
+
 ## Explicit safety rules baked into the mapping
 
 - Never invents facts, dates, employers, or numbers not present in the profile.
@@ -87,7 +101,7 @@ Adjust `MAX_FORM_STEPS` at the top of `main.py` to control how many steps a mult
 pytest
 ```
 
-69 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, dynamic/bare "Apply" button detection, mapping cache, batching and per-batch failure isolation, the interactive review flow (including the notification callback), and the web GUI's bridge/WebSocket layer (streaming, start/stop, reconnect mid-prompt).
+166 tests covering field extraction, dropdown/combobox/radio-group/checkbox-group filling, the "Other" fallback, dynamic/bare "Apply" button detection, mapping cache, batching and per-batch failure isolation, the interactive review flow (including the notification callback), the Workday-specific deterministic layer (My Information, Voluntary Disclosures, Self-Identify, repeating Work Experience/Education panels), and the web GUI's bridge/WebSocket layer (streaming, start/stop, reconnect mid-prompt).
 
 ## Project layout
 
@@ -95,10 +109,12 @@ pytest
 - `webapp.py` — FastAPI web GUI: runs the same automation in a background thread and streams it to a browser tab over WebSocket.
 - `static/index.html` — the web GUI's single-page frontend.
 - `autofill.py` — the actual engine: field extraction, LLM mapping, form filling, multi-step handling.
+- `workday.py` — the hardcoded, no-LLM deterministic layer for Workday (`myworkdayjobs.com`) applications (see "Workday support" above).
 - `mapping_cache.py` — local JSON cache of LLM field mappings, keyed by domain + field-set hash.
 - `application_tracking.py` — local JSON record of what's been applied to and what still needs review.
 - `profile.json` (gitignored) / `profile.example.json` (template) — candidate profile data.
 - `main_autofill.py` — the pytest suite for `autofill.py`.
+- `test_workday.py` — the pytest suite for `workday.py`.
 - `test_webapp.py` — the pytest suite for `webapp.py`.
 
 ## Tech stack
